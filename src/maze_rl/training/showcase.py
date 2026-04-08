@@ -1,0 +1,709 @@
+"""Checkpoint showcase helpers for sequential playback and summaries."""
+
+from __future__ import annotations
+
+from copy import deepcopy
+import json
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Callable
+
+import numpy as np
+
+from maze_rl.config import MazeConfig, maze_config_from_dict
+from maze_rl.envs.maze_env import MazeEnv
+from maze_rl.envs.entities import Position
+from maze_rl.policies.model_factory import load_model_from_checkpoint, predict_action
+from maze_rl.training.checkpointing import load_checkpoint_metadata, resolve_checkpoint_path
+
+
+@dataclass(frozen=True)
+class ShowcaseResult:
+    """One showcase row for a checkpoint episode."""
+
+    checkpoint: str
+    status: str
+    outcome: str
+    escape_rate: float
+    coverage: float
+    steps: int
+    revisits: int
+    oscillations: int
+    dead_ends: int
+    start_monster_distance: float | None
+    time_to_capture: float | None
+    frontier_rate: float
+    peak_no_progress_streak: int
+    final_player_position: tuple[int, int] | None = None
+    final_monster_position: tuple[int, int] | None = None
+    final_distance: int | None = None
+    capture_rule: str | None = None
+    final_state: dict[str, Any] | None = None
+    checkpoint_path: str | None = None
+    seed: int | None = None
+    notes: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the showcase row."""
+
+        payload = asdict(self)
+        final_state = payload.get("final_state")
+        if isinstance(final_state, dict):
+            final_state.pop("player", None)
+            final_state.pop("monster", None)
+            final_state.pop("exit", None)
+        return payload
+
+
+@dataclass(frozen=True)
+class RecordedRun:
+    """Recorded micro-step frames and final result for exact replay."""
+
+    frames: list[dict[str, Any]]
+    result: ShowcaseResult
+
+
+@dataclass
+class RecordedPlaybackSession:
+    """Replay a previously recorded micro-step frame sequence."""
+
+    recorded_run: RecordedRun
+
+    def __post_init__(self) -> None:
+        self.frames = [deepcopy(frame) for frame in self.recorded_run.frames]
+        self.index = 0
+        self.latest_state = deepcopy(self.frames[0]) if self.frames else {}
+        self.done = False
+        self.result: ShowcaseResult | None = None
+
+    def advance(self) -> tuple[dict[str, Any], ShowcaseResult | None]:
+        """Advance one recorded micro-step frame."""
+
+        if self.done:
+            return self.latest_state, self.result
+        if not self.frames:
+            self.result = self.recorded_run.result
+            self.done = True
+            return self.latest_state, self.result
+        if self.index >= len(self.frames) - 1:
+            self.result = self.recorded_run.result
+            self.done = True
+            return self.latest_state, self.result
+        self.index += 1
+        self.latest_state = deepcopy(self.frames[self.index])
+        if self.index >= len(self.frames) - 1:
+            self.result = self.recorded_run.result
+            self.done = True
+            return self.latest_state, self.result
+        return self.latest_state, None
+
+
+def _decorate_committed_state(
+    checkpoint_label: str,
+    snapshot: dict[str, Any],
+    outcome: str,
+    turn_step: int,
+    replay_turn: dict[str, Any] | None,
+    capture_diagnostics: dict[str, Any],
+    frontier_rate: float,
+    start_monster_distance: float | None,
+    time_to_capture: float | None,
+    action_index: int | None,
+    action_direction: int | None,
+    action_speed: int | None,
+    peak_no_progress_streak: int,
+) -> dict[str, Any]:
+    """Build the authoritative committed state for one completed turn."""
+
+    state = dict(snapshot)
+    player_position = tuple(state.get("player_position", (0, 0)))
+    monster_position = tuple(state.get("monster_position", (0, 0)))
+    state.update(
+        {
+            "checkpoint_label": checkpoint_label,
+            "outcome": outcome,
+            "peak_no_progress_streak": peak_no_progress_streak,
+            "start_monster_distance": start_monster_distance,
+            "time_to_capture": time_to_capture,
+            "frontier_rate": frontier_rate,
+            "action_index": action_index,
+            "action_direction": action_direction,
+            "action_speed": action_speed,
+            "capture_diagnostics": capture_diagnostics,
+            "replay_turn": replay_turn,
+            "turn_step": turn_step,
+            "current_micro_step": 0,
+            "micro_step_count": 0,
+            "micro_actor": None,
+            "micro_phase": "idle",
+            "rendered_player_position": player_position,
+            "rendered_monster_position": monster_position,
+            "committed_player_position": player_position,
+            "committed_monster_position": monster_position,
+            "player_position": player_position,
+            "monster_position": monster_position,
+            "player": Position(*player_position),
+            "monster": Position(*monster_position),
+        }
+    )
+    return state
+
+
+def _build_microstep_frames(committed_state: dict[str, Any], replay_turn: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Build rendered micro-step frames from one structured replay event."""
+
+    if not replay_turn:
+        frame = deepcopy(committed_state)
+        frame["micro_phase"] = "committed"
+        return [frame]
+
+    rendered_player = tuple(replay_turn["player_start_position"])
+    rendered_monster = tuple(replay_turn["monster_start_position"])
+    micro_steps = replay_turn.get("micro_steps", [])
+    total_micro_steps = len(micro_steps)
+    if total_micro_steps == 0:
+        frame = deepcopy(committed_state)
+        frame.update({"micro_phase": "committed", "micro_step_count": 0, "current_micro_step": 0})
+        return [frame]
+
+    frames: list[dict[str, Any]] = []
+    for index, micro_step in enumerate(micro_steps, start=1):
+        if micro_step["actor"] == "player":
+            rendered_player = tuple(micro_step["position"])
+        else:
+            rendered_monster = tuple(micro_step["position"])
+        frame = deepcopy(committed_state)
+        frame.update(
+            {
+                "player": Position(*rendered_player),
+                "monster": Position(*rendered_monster),
+                "player_position": rendered_player,
+                "monster_position": rendered_monster,
+                "player_monster_distance": abs(rendered_player[0] - rendered_monster[0]) + abs(rendered_player[1] - rendered_monster[1]),
+                "rendered_player_position": rendered_player,
+                "rendered_monster_position": rendered_monster,
+                "current_micro_step": index,
+                "micro_step_count": total_micro_steps,
+                "micro_actor": micro_step["actor"],
+                "micro_phase": micro_step["phase"],
+                "capture_event": replay_turn.get("capture_event") if micro_step.get("capture") else None,
+            }
+        )
+        if index == total_micro_steps:
+            frame.update(
+                {
+                    "player": Position(*committed_state["committed_player_position"]),
+                    "monster": Position(*committed_state["committed_monster_position"]),
+                    "player_position": committed_state["committed_player_position"],
+                    "monster_position": committed_state["committed_monster_position"],
+                    "rendered_player_position": committed_state["committed_player_position"],
+                    "rendered_monster_position": committed_state["committed_monster_position"],
+                    "player_monster_distance": committed_state["player_monster_distance"],
+                    "micro_phase": "committed",
+                    "capture_event": replay_turn.get("capture_event"),
+                }
+            )
+        frames.append(frame)
+    return frames
+
+
+@dataclass
+class PlaybackSession:
+    """Incremental deterministic playback session for app and viewer controls."""
+
+    checkpoint_path: str | Path
+    checkpoint_label: str
+    seed: int
+    max_no_progress_streak: int = 25
+    wall_time_timeout_s: float = 30.0
+    debug_trace: bool = False
+
+    def __post_init__(self) -> None:
+        self.model, self.env, _ = load_checkpoint_for_playback(self.checkpoint_path)
+        self.observation, _ = self.env.reset(seed=self.seed, options={"maze_seed": self.seed})
+        self.recurrent_state = None
+        self.episode_start = np.ones((1,), dtype=bool)
+        self.started_at = time.monotonic()
+        self.no_progress_streak = 0
+        self.last_frontier_count = 0
+        self.done = False
+        self.result: ShowcaseResult | None = None
+        self.pending_states: list[dict[str, Any]] = []
+        self.pending_result: ShowcaseResult | None = None
+        self.latest_state = _decorate_committed_state(
+            checkpoint_label=self.checkpoint_label,
+            snapshot=self.env.get_render_state(),
+            outcome="running",
+            turn_step=0,
+            replay_turn=None,
+            capture_diagnostics={},
+            frontier_rate=0.0,
+            start_monster_distance=self.env.start_monster_distance,
+            time_to_capture=None,
+            action_index=None,
+            action_direction=None,
+            action_speed=None,
+            peak_no_progress_streak=0,
+        )
+        self.recorded_frames: list[dict[str, Any]] = [deepcopy(self.latest_state)]
+
+    def advance(self) -> tuple[dict[str, Any], ShowcaseResult | None]:
+        """Advance one micro-step frame and return the live state and optional final result."""
+
+        if self.done:
+            return self.latest_state, self.result
+        if self.pending_states:
+            self.latest_state = deepcopy(self.pending_states.pop(0))
+            self.recorded_frames.append(deepcopy(self.latest_state))
+            if not self.pending_states and self.pending_result is not None:
+                self.result = self.pending_result
+                self.pending_result = None
+                self.done = True
+                return self.latest_state, self.result
+            return self.latest_state, None
+        action, self.recurrent_state = predict_action(
+            model=self.model,
+            observation=self.observation,
+            deterministic=True,
+            recurrent_state=self.recurrent_state,
+            episode_start=self.episode_start,
+            action_masks=np.asarray(self.env.action_masks(), dtype=bool),
+        )
+        direction, speed = self.env.decode_action(int(action))
+        self.observation, _, terminated, truncated, info = self.env.step(int(action))
+        self.episode_start = np.array([terminated or truncated], dtype=bool)
+
+        frontier_count = int(info.get("frontier_cells_visited", 0))
+        if frontier_count > self.last_frontier_count:
+            self.no_progress_streak = 0
+            self.last_frontier_count = frontier_count
+        else:
+            self.no_progress_streak += 1
+
+        replay_turn = info.get("replay_turn")
+        committed_state = _decorate_committed_state(
+            checkpoint_label=self.checkpoint_label,
+            snapshot=info["state_snapshot"],
+            outcome=info.get("outcome", "running"),
+            turn_step=int(info["state_snapshot"].get("steps", 0)),
+            replay_turn=replay_turn,
+            capture_diagnostics=info.get("capture_diagnostics", {}),
+            frontier_rate=1.0 if info.get("reached_new_frontier") else 0.0,
+            start_monster_distance=info.get("start_monster_distance"),
+            time_to_capture=info.get("time_to_capture"),
+            action_index=int(action),
+            action_direction=direction,
+            action_speed=speed,
+            peak_no_progress_streak=max(self.env.peak_no_progress_steps, self.no_progress_streak),
+        )
+        self.pending_states = _build_microstep_frames(committed_state=committed_state, replay_turn=replay_turn)
+
+        if self.debug_trace:
+            print(
+                f"step={committed_state['steps']:03d} ckpt={self.checkpoint_label} action={int(action):02d} dir={direction} speed={speed} "
+                f"player={committed_state['player_position']} monster={committed_state['monster_position']} "
+                f"distance={committed_state['player_monster_distance']} outcome={committed_state['outcome']}"
+            )
+
+        forced_outcome: str | None = None
+        if time.monotonic() - self.started_at > self.wall_time_timeout_s:
+            forced_outcome = "timeout"
+        elif self.no_progress_streak >= self.max_no_progress_streak:
+            forced_outcome = "no_progress"
+
+        if terminated or truncated or forced_outcome is not None:
+            if terminated or truncated:
+                metrics = info["episode_metrics"]
+                self.pending_result = ShowcaseResult(
+                    checkpoint=self.checkpoint_label,
+                    status="ok",
+                    outcome=metrics.outcome,
+                    escape_rate=1.0 if metrics.outcome == "escaped" else 0.0,
+                    coverage=metrics.coverage,
+                    steps=metrics.steps,
+                    revisits=metrics.revisits,
+                    oscillations=metrics.oscillations,
+                    dead_ends=metrics.dead_end_entries,
+                    start_monster_distance=float(metrics.start_monster_distance),
+                    time_to_capture=float(metrics.time_to_capture) if metrics.time_to_capture is not None else None,
+                    frontier_rate=1.0 if metrics.reached_new_frontier else 0.0,
+                    peak_no_progress_streak=metrics.peak_no_progress_steps,
+                    final_player_position=metrics.final_player_position,
+                    final_monster_position=metrics.final_monster_position,
+                    final_distance=metrics.final_player_monster_distance,
+                    capture_rule=metrics.capture_rule,
+                    final_state=deepcopy(committed_state),
+                    checkpoint_path=str(self.checkpoint_path),
+                    seed=self.seed,
+                )
+            else:
+                self.pending_result = ShowcaseResult(
+                    checkpoint=self.checkpoint_label,
+                    status="forced-stop",
+                    outcome=forced_outcome or "timeout",
+                    escape_rate=0.0,
+                    coverage=self.env.coverage,
+                    steps=self.env.step_count,
+                    revisits=self.env.revisits,
+                    oscillations=self.env.oscillations,
+                    dead_ends=self.env.dead_end_entries,
+                    start_monster_distance=float(self.env.start_monster_distance),
+                    time_to_capture=None,
+                    frontier_rate=1.0 if self.env.frontier_cells_visited > 0 else 0.0,
+                    peak_no_progress_streak=max(self.env.peak_no_progress_steps, self.no_progress_streak),
+                    final_player_position=self.env.player.as_tuple() if self.env.player is not None else None,
+                    final_monster_position=self.env.monster.as_tuple() if self.env.monster is not None else None,
+                    final_distance=committed_state.get("player_monster_distance"),
+                    capture_rule=self.env.last_capture_rule,
+                    final_state=deepcopy(committed_state),
+                    checkpoint_path=str(self.checkpoint_path),
+                    seed=self.seed,
+                    notes="playback stopped by watchdog",
+                )
+        if not self.pending_states:
+            self.pending_states = [deepcopy(committed_state)]
+        return self.advance()
+
+    def build_recorded_run(self) -> RecordedRun | None:
+        """Return the recorded frame sequence for exact replay."""
+
+        if self.result is None:
+            return None
+        return RecordedRun(frames=[deepcopy(frame) for frame in self.recorded_frames], result=self.result)
+
+@dataclass
+class BaselinePlaybackSession:
+    """Incremental playback session for a deterministic non-learning legal mover."""
+
+    maze_config: MazeConfig
+    checkpoint_label: str
+    seed: int
+    max_no_progress_streak: int = 25
+    wall_time_timeout_s: float = 30.0
+    debug_trace: bool = False
+
+    def __post_init__(self) -> None:
+        self.env = MazeEnv(self.maze_config, training_mode=False)
+        self.observation, _ = self.env.reset(seed=self.seed, options={"maze_seed": self.seed})
+        self.rng = np.random.default_rng(self.seed)
+        self.started_at = time.monotonic()
+        self.no_progress_streak = 0
+        self.last_frontier_count = 0
+        self.done = False
+        self.result: ShowcaseResult | None = None
+        self.pending_states: list[dict[str, Any]] = []
+        self.pending_result: ShowcaseResult | None = None
+        self.latest_state = _decorate_committed_state(
+            checkpoint_label=self.checkpoint_label,
+            snapshot=self.env.get_render_state(),
+            outcome="running",
+            turn_step=0,
+            replay_turn=None,
+            capture_diagnostics={},
+            frontier_rate=0.0,
+            start_monster_distance=self.env.start_monster_distance,
+            time_to_capture=None,
+            action_index=None,
+            action_direction=None,
+            action_speed=None,
+            peak_no_progress_streak=0,
+        )
+        self.recorded_frames: list[dict[str, Any]] = [deepcopy(self.latest_state)]
+
+    def advance(self) -> tuple[dict[str, Any], ShowcaseResult | None]:
+        """Advance one micro-step frame and return the live state and optional final result."""
+
+        if self.done:
+            return self.latest_state, self.result
+        if self.pending_states:
+            self.latest_state = deepcopy(self.pending_states.pop(0))
+            self.recorded_frames.append(deepcopy(self.latest_state))
+            if not self.pending_states and self.pending_result is not None:
+                self.result = self.pending_result
+                self.pending_result = None
+                self.done = True
+                return self.latest_state, self.result
+            return self.latest_state, None
+
+        action = self._choose_legal_action()
+        direction, speed = self.env.decode_action(int(action))
+        self.observation, _, terminated, truncated, info = self.env.step(int(action))
+
+        frontier_count = int(info.get("frontier_cells_visited", 0))
+        if frontier_count > self.last_frontier_count:
+            self.no_progress_streak = 0
+            self.last_frontier_count = frontier_count
+        else:
+            self.no_progress_streak += 1
+
+        replay_turn = info.get("replay_turn")
+        committed_state = _decorate_committed_state(
+            checkpoint_label=self.checkpoint_label,
+            snapshot=info["state_snapshot"],
+            outcome=info.get("outcome", "running"),
+            turn_step=int(info["state_snapshot"].get("steps", 0)),
+            replay_turn=replay_turn,
+            capture_diagnostics=info.get("capture_diagnostics", {}),
+            frontier_rate=1.0 if info.get("reached_new_frontier") else 0.0,
+            start_monster_distance=info.get("start_monster_distance"),
+            time_to_capture=info.get("time_to_capture"),
+            action_index=int(action),
+            action_direction=direction,
+            action_speed=speed,
+            peak_no_progress_streak=max(self.env.peak_no_progress_steps, self.no_progress_streak),
+        )
+        committed_state["policy_kind"] = "baseline-legal-mover"
+        self.pending_states = _build_microstep_frames(committed_state=committed_state, replay_turn=replay_turn)
+
+        if self.debug_trace:
+            print(
+                f"step={committed_state['steps']:03d} baseline action={int(action):02d} dir={direction} speed={speed} "
+                f"player={committed_state['player_position']} monster={committed_state['monster_position']} outcome={committed_state['outcome']}"
+            )
+
+        forced_outcome: str | None = None
+        if time.monotonic() - self.started_at > self.wall_time_timeout_s:
+            forced_outcome = "timeout"
+        elif self.no_progress_streak >= self.max_no_progress_streak:
+            forced_outcome = "no_progress"
+
+        if terminated or truncated or forced_outcome is not None:
+            if terminated or truncated:
+                metrics = info["episode_metrics"]
+                self.pending_result = ShowcaseResult(
+                    checkpoint=self.checkpoint_label,
+                    status="ok",
+                    outcome=metrics.outcome,
+                    escape_rate=1.0 if metrics.outcome == "escaped" else 0.0,
+                    coverage=metrics.coverage,
+                    steps=metrics.steps,
+                    revisits=metrics.revisits,
+                    oscillations=metrics.oscillations,
+                    dead_ends=metrics.dead_end_entries,
+                    start_monster_distance=float(metrics.start_monster_distance),
+                    time_to_capture=float(metrics.time_to_capture) if metrics.time_to_capture is not None else None,
+                    frontier_rate=1.0 if metrics.reached_new_frontier else 0.0,
+                    peak_no_progress_streak=metrics.peak_no_progress_steps,
+                    final_player_position=metrics.final_player_position,
+                    final_monster_position=metrics.final_monster_position,
+                    final_distance=metrics.final_player_monster_distance,
+                    capture_rule=metrics.capture_rule,
+                    final_state=deepcopy(committed_state),
+                    checkpoint_path=None,
+                    seed=self.seed,
+                    notes="baseline legal mover",
+                )
+            else:
+                self.pending_result = ShowcaseResult(
+                    checkpoint=self.checkpoint_label,
+                    status="forced-stop",
+                    outcome=forced_outcome or "timeout",
+                    escape_rate=0.0,
+                    coverage=self.env.coverage,
+                    steps=self.env.step_count,
+                    revisits=self.env.revisits,
+                    oscillations=self.env.oscillations,
+                    dead_ends=self.env.dead_end_entries,
+                    start_monster_distance=float(self.env.start_monster_distance),
+                    time_to_capture=None,
+                    frontier_rate=1.0 if self.env.frontier_cells_visited > 0 else 0.0,
+                    peak_no_progress_streak=max(self.env.peak_no_progress_steps, self.no_progress_streak),
+                    final_player_position=self.env.player.as_tuple() if self.env.player is not None else None,
+                    final_monster_position=self.env.monster.as_tuple() if self.env.monster is not None else None,
+                    final_distance=committed_state.get("player_monster_distance"),
+                    capture_rule=self.env.last_capture_rule,
+                    final_state=deepcopy(committed_state),
+                    checkpoint_path=None,
+                    seed=self.seed,
+                    notes="baseline playback stopped by watchdog",
+                )
+        if not self.pending_states:
+            self.pending_states = [deepcopy(committed_state)]
+        return self.advance()
+
+    def build_recorded_run(self) -> RecordedRun | None:
+        """Return the recorded frame sequence for exact replay."""
+
+        if self.result is None:
+            return None
+        return RecordedRun(frames=[deepcopy(frame) for frame in self.recorded_frames], result=self.result)
+
+    def _choose_legal_action(self) -> int:
+        """Choose a reproducible non-learning legal move."""
+
+        if self.env.player is None:
+            return 0
+        legal_actions: list[int] = []
+        for direction in range(4):
+            candidate = self._candidate_for_direction(direction)
+            if self._is_wall(candidate):
+                continue
+            legal_actions.append(direction * self.env.config.max_player_speed)
+        if not legal_actions:
+            return 0
+        return int(self.rng.choice(legal_actions))
+
+    def _candidate_for_direction(self, direction: int) -> Position:
+        delta_row, delta_col = [(-1, 0), (0, 1), (1, 0), (0, -1)][direction]
+        return self.env.player.shifted(delta_row, delta_col)
+
+    def _is_wall(self, position: Position) -> bool:
+        if self.env.layout is None:
+            return True
+        return (
+            position.row < 0
+            or position.col < 0
+            or position.row >= self.env.layout.rows
+            or position.col >= self.env.layout.cols
+            or self.env.layout.grid[position.row][position.col] == "#"
+        )
+
+
+def load_checkpoint_for_playback(checkpoint_path: str | Path) -> tuple[Any, MazeEnv, dict[str, Any]]:
+    """Load a checkpoint model and environment for deterministic playback."""
+
+    metadata = load_checkpoint_metadata(checkpoint_path)
+    maze_config = maze_config_from_dict(metadata["maze_config"])
+    env = MazeEnv(maze_config, training_mode=False)
+    model = load_model_from_checkpoint(checkpoint_path, env)
+    return model, env, metadata
+
+
+def run_checkpoint_showcase_episode(
+    checkpoint_path: str | Path,
+    checkpoint_label: str,
+    seed: int,
+    max_no_progress_streak: int = 25,
+    wall_time_timeout_s: float = 30.0,
+    on_step: Callable[[dict[str, Any]], bool] | None = None,
+    debug_trace: bool = False,
+) -> ShowcaseResult:
+    """Run one deterministic checkpoint episode with guardrails."""
+
+    session = PlaybackSession(
+        checkpoint_path=checkpoint_path,
+        checkpoint_label=checkpoint_label,
+        seed=seed,
+        max_no_progress_streak=max_no_progress_streak,
+        wall_time_timeout_s=wall_time_timeout_s,
+        debug_trace=debug_trace,
+    )
+    while True:
+        state, result = session.advance()
+        if on_step is not None and not on_step(state):
+            return ShowcaseResult(
+                checkpoint=checkpoint_label,
+                status="aborted",
+                outcome="aborted",
+                escape_rate=0.0,
+                coverage=session.env.coverage,
+                steps=session.env.step_count,
+                revisits=session.env.revisits,
+                oscillations=session.env.oscillations,
+                dead_ends=session.env.dead_end_entries,
+                start_monster_distance=float(session.env.start_monster_distance),
+                time_to_capture=None,
+                frontier_rate=1.0 if session.env.frontier_cells_visited > 0 else 0.0,
+                peak_no_progress_streak=max(session.env.peak_no_progress_steps, session.no_progress_streak),
+                final_player_position=session.env.player.as_tuple() if session.env.player is not None else None,
+                final_monster_position=session.env.monster.as_tuple() if session.env.monster is not None else None,
+                final_distance=state.get("player_monster_distance"),
+                capture_rule=session.env.last_capture_rule,
+                final_state=state,
+                checkpoint_path=str(checkpoint_path),
+                seed=seed,
+                notes="playback aborted by viewer",
+            )
+        if result is not None:
+            return result
+
+
+def build_missing_result(checkpoint_episode: int, checkpoint_path: str | Path, seed: int) -> ShowcaseResult:
+    """Build a skipped row for a missing checkpoint."""
+
+    return ShowcaseResult(
+        checkpoint=f"ckpt {checkpoint_episode:04d}",
+        status="missing",
+        outcome="skipped",
+        escape_rate=0.0,
+        coverage=0.0,
+        steps=0,
+        revisits=0,
+        oscillations=0,
+        dead_ends=0,
+        start_monster_distance=None,
+        time_to_capture=None,
+        frontier_rate=0.0,
+        peak_no_progress_streak=0,
+        final_player_position=None,
+        final_monster_position=None,
+        final_distance=None,
+        capture_rule=None,
+        final_state=None,
+        checkpoint_path=str(checkpoint_path),
+        seed=seed,
+        notes="checkpoint missing",
+    )
+
+
+def run_showcase_headless(
+    checkpoint_dir: str | Path,
+    checkpoints: list[int],
+    seed: int,
+    max_no_progress_streak: int = 25,
+    wall_time_timeout_s: float = 30.0,
+    debug_trace: bool = False,
+) -> list[ShowcaseResult]:
+    """Run a sequential headless showcase over checkpoint episodes."""
+
+    results: list[ShowcaseResult] = []
+    for checkpoint_episode in checkpoints:
+        checkpoint_path = resolve_checkpoint_path(checkpoint_dir, checkpoint_episode)
+        if not Path(checkpoint_path).exists():
+            results.append(build_missing_result(checkpoint_episode, checkpoint_path, seed))
+            continue
+        results.append(
+            run_checkpoint_showcase_episode(
+                checkpoint_path=checkpoint_path,
+                checkpoint_label=f"ckpt {checkpoint_episode:04d}",
+                seed=seed,
+                max_no_progress_streak=max_no_progress_streak,
+                wall_time_timeout_s=wall_time_timeout_s,
+                debug_trace=debug_trace,
+            )
+        )
+    return results
+
+
+def save_showcase_summary(results: list[ShowcaseResult], seed: int, output_path: str | Path | None = None) -> Path:
+    """Write showcase results to a JSON file."""
+
+    output = Path(output_path) if output_path is not None else Path("replays") / f"showcase_seed_{seed}_{int(time.time())}.json"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "seed": seed,
+        "generated_at": int(time.time()),
+        "results": [item.to_dict() for item in results],
+    }
+    output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return output
+
+
+def format_showcase_table(results: list[ShowcaseResult]) -> list[str]:
+    """Build a readable row-per-checkpoint summary table."""
+
+    header = (
+        "checkpoint | status | outcome | escape_rate | coverage | steps | revisits | oscillations | "
+        "dead_ends | start_monster_distance | time_to_capture | frontier_rate | peak_no_progress_streak"
+    )
+    lines = [header]
+    for item in results:
+        lines.append(
+            f"{item.checkpoint} | {item.status} | {item.outcome} | {item.escape_rate:.2f} | "
+            f"{item.coverage:.2f} | {item.steps} | {item.revisits} | {item.oscillations} | "
+            f"{item.dead_ends} | {item.start_monster_distance if item.start_monster_distance is not None else 'n/a'} | "
+            f"{item.time_to_capture if item.time_to_capture is not None else 'n/a'} | {item.frontier_rate:.2f} | "
+            f"{item.peak_no_progress_streak}"
+        )
+    return lines
