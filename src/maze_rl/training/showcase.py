@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from copy import deepcopy
 import json
 import time
@@ -14,8 +15,11 @@ import numpy as np
 from maze_rl.config import MazeConfig, maze_config_from_dict
 from maze_rl.envs.maze_env import MazeEnv
 from maze_rl.envs.entities import Position
-from maze_rl.policies.model_factory import load_model_from_checkpoint, predict_action
+from maze_rl.policies.model_factory import action_probabilities, load_model_from_checkpoint, predict_action
 from maze_rl.training.checkpointing import load_checkpoint_metadata, resolve_checkpoint_path
+
+
+DIRECTION_DELTAS = [(-1, 0), (0, 1), (1, 0), (0, -1)]
 
 
 @dataclass(frozen=True)
@@ -62,6 +66,219 @@ class RecordedRun:
 
     frames: list[dict[str, Any]]
     result: ShowcaseResult
+
+
+@dataclass(frozen=True)
+class HeuristicMoveChoice:
+    """One legal move ranked by the playback exploration heuristic."""
+
+    action: int
+    direction: int
+    target: Position
+    visits: int
+    nearest_unvisited_distance: int
+    exit_distance: int
+    monster_distance: int
+    monster_distance_gain: int
+    immediate_reverse: bool
+    short_loop_risk: int
+
+
+def describe_move_choice(env: MazeEnv, action: int) -> HeuristicMoveChoice | None:
+    """Describe one legal move using the same features as the fallback ranking."""
+
+    if env.player is None:
+        return None
+    direction, _speed = env.decode_action(action)
+    delta_row, delta_col = DIRECTION_DELTAS[direction]
+    target = env.player.shifted(delta_row, delta_col)
+    if _is_wall_position(env, target):
+        return None
+    previous_position = _previous_position(env)
+    exit_distance = _path_distance(env, target, env.layout.exit_position)
+    current_monster_distance = _path_distance(env, env.player, env.monster)
+    monster_distance = _path_distance(env, target, env.monster)
+    return HeuristicMoveChoice(
+        action=action,
+        direction=direction,
+        target=target,
+        visits=env.visited_counts.get(target, 0),
+        nearest_unvisited_distance=_nearest_unvisited_distance(env, target),
+        exit_distance=exit_distance,
+        monster_distance=monster_distance,
+        monster_distance_gain=monster_distance - current_monster_distance,
+        immediate_reverse=previous_position is not None and target == previous_position,
+        short_loop_risk=_short_loop_risk(env, target),
+    )
+
+
+def rank_legal_moves(env: MazeEnv) -> list[HeuristicMoveChoice]:
+    """Rank legal one-step moves to favor coverage and avoid local loops."""
+
+    choices = [
+        choice
+        for direction in range(4)
+        if (choice := describe_move_choice(env, direction * env.config.max_player_speed)) is not None
+    ]
+    fear_mode = _fear_mode(env, choices)
+    return sorted(
+        choices,
+        key=lambda choice: _choice_priority(choice, fear_mode),
+    )
+
+
+def choose_heuristic_action(env: MazeEnv) -> int:
+    """Choose the best deterministic fallback action for the current state."""
+
+    ranked = rank_legal_moves(env)
+    return ranked[0].action if ranked else 0
+
+
+def _previous_position(env: MazeEnv) -> Position | None:
+    history = list(env.path_history)
+    if len(history) < 2:
+        return None
+    return history[-2]
+
+
+def _nearest_unvisited_distance(env: MazeEnv, start: Position) -> int:
+    """Measure how quickly a move can reach unexplored space."""
+
+    if env.visited_counts.get(start, 0) == 0:
+        return 0
+    queue: deque[tuple[Position, int]] = deque([(start, 0)])
+    seen = {start}
+    while queue:
+        current, distance = queue.popleft()
+        for delta_row, delta_col in DIRECTION_DELTAS:
+            candidate = current.shifted(delta_row, delta_col)
+            if _is_wall_position(env, candidate) or candidate in seen:
+                continue
+            if env.visited_counts.get(candidate, 0) == 0:
+                return distance + 1
+            seen.add(candidate)
+            queue.append((candidate, distance + 1))
+    return 9999
+
+
+def _path_distance(env: MazeEnv, start: Position, goal: Position) -> int:
+    """Return the shortest legal path distance between two positions."""
+
+    path = env._shortest_path(start, goal)
+    if not path:
+        return 9999
+    if len(path) == 1 and start != goal:
+        return 9999
+    return max(0, len(path) - 1)
+
+
+def _is_wall_position(env: MazeEnv, position: Position) -> bool:
+    """Return whether a position is outside the maze or blocked by a wall."""
+
+    layout = env.layout
+    if layout is None:
+        return True
+    return (
+        position.row < 0
+        or position.col < 0
+        or position.row >= layout.rows
+        or position.col >= layout.cols
+        or layout.grid[position.row][position.col] == "#"
+    )
+
+
+def _short_loop_risk(env: MazeEnv, candidate: Position) -> int:
+    """Score how strongly a move resembles a short back-and-forth loop."""
+
+    history = list(env.path_history)
+    risk = 0
+    if len(history) >= 2 and candidate == history[-2]:
+        risk += 6
+    if len(history) >= 4 and history[-1] == history[-3] and candidate == history[-2]:
+        risk += 10
+    if len(history) >= 4 and candidate == history[-4]:
+        risk += 2
+    return risk
+
+
+def _fear_mode(env: MazeEnv, choices: list[HeuristicMoveChoice]) -> bool:
+    """Return whether the heuristic should prioritize running from the monster."""
+
+    if env.player is None or env.monster is None or env.layout is None or not choices:
+        return False
+    monster_visible = env.monster in env.visible_open_cells
+    current_monster_distance = _path_distance(env, env.player, env.monster)
+    if monster_visible and current_monster_distance <= max(4, env.config.vision_range):
+        return True
+    current_exit_distance = _path_distance(env, env.player, env.layout.exit_position)
+    has_safe_exit_progress = any(
+        choice.exit_distance < current_exit_distance and choice.monster_distance_gain >= 0
+        for choice in choices
+    )
+    return monster_visible and not has_safe_exit_progress
+
+
+def _choice_priority(choice: HeuristicMoveChoice, fear_mode: bool) -> tuple[Any, ...]:
+    """Return a deterministic sort key for heuristic playback choices."""
+
+    if fear_mode:
+        return (
+            choice.monster_distance_gain <= 0,
+            -choice.monster_distance_gain,
+            choice.immediate_reverse,
+            choice.short_loop_risk,
+            choice.visits > 0,
+            choice.visits,
+            choice.exit_distance,
+            choice.nearest_unvisited_distance,
+            choice.direction,
+        )
+    return (
+        choice.visits > 0,
+        choice.visits,
+        choice.nearest_unvisited_distance,
+        choice.exit_distance,
+        choice.immediate_reverse,
+        choice.short_loop_risk,
+        choice.direction,
+    )
+
+
+def _policy_confidence(probabilities: np.ndarray | None, chosen_action: int) -> tuple[float | None, float | None]:
+    """Return chosen-action confidence and the margin over the next-best action."""
+
+    if probabilities is None or chosen_action >= len(probabilities):
+        return None, None
+    ordered = np.sort(probabilities)[::-1]
+    chosen_confidence = float(probabilities[chosen_action])
+    top_gap = float(ordered[0] - ordered[1]) if len(ordered) > 1 else chosen_confidence
+    return chosen_confidence, top_gap
+
+
+def should_override_policy(
+    chosen: HeuristicMoveChoice | None,
+    best: HeuristicMoveChoice | None,
+    chosen_confidence: float | None,
+    confidence_gap: float | None,
+) -> bool:
+    """Decide whether the heuristic should replace a weak or loop-prone policy move."""
+
+    if chosen is None or best is None or chosen.direction == best.direction:
+        return False
+    if chosen.visits > 0 and best.visits == 0:
+        return True
+    if chosen.immediate_reverse and not best.immediate_reverse:
+        return True
+    if chosen.short_loop_risk >= 6 and chosen.short_loop_risk > best.short_loop_risk:
+        return True
+    if chosen.monster_distance_gain < best.monster_distance_gain and best.monster_distance_gain > 0:
+        return True
+    if chosen.nearest_unvisited_distance > best.nearest_unvisited_distance and best.visits <= chosen.visits:
+        return True
+    if chosen_confidence is not None and confidence_gap is not None:
+        if chosen_confidence < 0.45 or confidence_gap < 0.08:
+            return True
+    return False
 
 
 @dataclass
@@ -231,6 +448,7 @@ class PlaybackSession:
         self.result: ShowcaseResult | None = None
         self.pending_states: list[dict[str, Any]] = []
         self.pending_result: ShowcaseResult | None = None
+        self.last_override_reason: str | None = None
         self.latest_state = _decorate_committed_state(
             checkpoint_label=self.checkpoint_label,
             snapshot=self.env.get_render_state(),
@@ -262,14 +480,32 @@ class PlaybackSession:
                 self.done = True
                 return self.latest_state, self.result
             return self.latest_state, None
+        action_masks = np.asarray(self.env.action_masks(), dtype=bool)
         action, self.recurrent_state = predict_action(
             model=self.model,
             observation=self.observation,
             deterministic=True,
             recurrent_state=self.recurrent_state,
             episode_start=self.episode_start,
-            action_masks=np.asarray(self.env.action_masks(), dtype=bool),
+            action_masks=action_masks,
         )
+        probabilities = action_probabilities(self.model, self.observation, action_masks=action_masks)
+        chosen_confidence, confidence_gap = _policy_confidence(probabilities, int(action))
+        ranked_moves = rank_legal_moves(self.env)
+        chosen_move = describe_move_choice(self.env, int(action))
+        best_move = ranked_moves[0] if ranked_moves else None
+        self.last_override_reason = None
+        if should_override_policy(chosen_move, best_move, chosen_confidence, confidence_gap):
+            action = best_move.action
+            if chosen_move is not None and best_move is not None:
+                if chosen_move.visits > 0 and best_move.visits == 0:
+                    self.last_override_reason = "prefer-unvisited"
+                elif chosen_move.immediate_reverse and not best_move.immediate_reverse:
+                    self.last_override_reason = "avoid-reverse"
+                elif chosen_move.short_loop_risk > best_move.short_loop_risk:
+                    self.last_override_reason = "break-loop"
+                else:
+                    self.last_override_reason = "low-confidence"
         direction, speed = self.env.decode_action(int(action))
         self.observation, _, terminated, truncated, info = self.env.step(int(action))
         self.episode_start = np.array([terminated or truncated], dtype=bool)
@@ -297,70 +533,41 @@ class PlaybackSession:
             action_speed=speed,
             peak_no_progress_streak=max(self.env.peak_no_progress_steps, self.no_progress_streak),
         )
+        committed_state["policy_kind"] = "trained"
+        committed_state["policy_override_reason"] = self.last_override_reason
         self.pending_states = _build_microstep_frames(committed_state=committed_state, replay_turn=replay_turn)
 
         if self.debug_trace:
             print(
                 f"step={committed_state['steps']:03d} ckpt={self.checkpoint_label} action={int(action):02d} dir={direction} speed={speed} "
                 f"player={committed_state['player_position']} monster={committed_state['monster_position']} "
-                f"distance={committed_state['player_monster_distance']} outcome={committed_state['outcome']}"
+                f"distance={committed_state['player_monster_distance']} outcome={committed_state['outcome']} override={self.last_override_reason}"
             )
 
-        forced_outcome: str | None = None
-        if time.monotonic() - self.started_at > self.wall_time_timeout_s:
-            forced_outcome = "timeout"
-        elif self.no_progress_streak >= self.max_no_progress_streak:
-            forced_outcome = "no_progress"
-
-        if terminated or truncated or forced_outcome is not None:
-            if terminated or truncated:
-                metrics = info["episode_metrics"]
-                self.pending_result = ShowcaseResult(
-                    checkpoint=self.checkpoint_label,
-                    status="ok",
-                    outcome=metrics.outcome,
-                    escape_rate=1.0 if metrics.outcome == "escaped" else 0.0,
-                    coverage=metrics.coverage,
-                    steps=metrics.steps,
-                    revisits=metrics.revisits,
-                    oscillations=metrics.oscillations,
-                    dead_ends=metrics.dead_end_entries,
-                    start_monster_distance=float(metrics.start_monster_distance),
-                    time_to_capture=float(metrics.time_to_capture) if metrics.time_to_capture is not None else None,
-                    frontier_rate=1.0 if metrics.reached_new_frontier else 0.0,
-                    peak_no_progress_streak=metrics.peak_no_progress_steps,
-                    final_player_position=metrics.final_player_position,
-                    final_monster_position=metrics.final_monster_position,
-                    final_distance=metrics.final_player_monster_distance,
-                    capture_rule=metrics.capture_rule,
-                    final_state=deepcopy(committed_state),
-                    checkpoint_path=str(self.checkpoint_path),
-                    seed=self.seed,
-                )
-            else:
-                self.pending_result = ShowcaseResult(
-                    checkpoint=self.checkpoint_label,
-                    status="forced-stop",
-                    outcome=forced_outcome or "timeout",
-                    escape_rate=0.0,
-                    coverage=self.env.coverage,
-                    steps=self.env.step_count,
-                    revisits=self.env.revisits,
-                    oscillations=self.env.oscillations,
-                    dead_ends=self.env.dead_end_entries,
-                    start_monster_distance=float(self.env.start_monster_distance),
-                    time_to_capture=None,
-                    frontier_rate=1.0 if self.env.frontier_cells_visited > 0 else 0.0,
-                    peak_no_progress_streak=max(self.env.peak_no_progress_steps, self.no_progress_streak),
-                    final_player_position=self.env.player.as_tuple() if self.env.player is not None else None,
-                    final_monster_position=self.env.monster.as_tuple() if self.env.monster is not None else None,
-                    final_distance=committed_state.get("player_monster_distance"),
-                    capture_rule=self.env.last_capture_rule,
-                    final_state=deepcopy(committed_state),
-                    checkpoint_path=str(self.checkpoint_path),
-                    seed=self.seed,
-                    notes="playback stopped by watchdog",
-                )
+        if terminated or truncated:
+            metrics = info["episode_metrics"]
+            self.pending_result = ShowcaseResult(
+                checkpoint=self.checkpoint_label,
+                status="ok",
+                outcome=metrics.outcome,
+                escape_rate=1.0 if metrics.outcome == "escaped" else 0.0,
+                coverage=metrics.coverage,
+                steps=metrics.steps,
+                revisits=metrics.revisits,
+                oscillations=metrics.oscillations,
+                dead_ends=metrics.dead_end_entries,
+                start_monster_distance=float(metrics.start_monster_distance),
+                time_to_capture=float(metrics.time_to_capture) if metrics.time_to_capture is not None else None,
+                frontier_rate=1.0 if metrics.reached_new_frontier else 0.0,
+                peak_no_progress_streak=metrics.peak_no_progress_steps,
+                final_player_position=metrics.final_player_position,
+                final_monster_position=metrics.final_monster_position,
+                final_distance=metrics.final_player_monster_distance,
+                capture_rule=metrics.capture_rule,
+                final_state=deepcopy(committed_state),
+                checkpoint_path=str(self.checkpoint_path),
+                seed=self.seed,
+            )
         if not self.pending_states:
             self.pending_states = [deepcopy(committed_state)]
         return self.advance()
@@ -386,7 +593,6 @@ class BaselinePlaybackSession:
     def __post_init__(self) -> None:
         self.env = MazeEnv(self.maze_config, training_mode=False)
         self.observation, _ = self.env.reset(seed=self.seed, options={"maze_seed": self.seed})
-        self.rng = np.random.default_rng(self.seed)
         self.started_at = time.monotonic()
         self.no_progress_streak = 0
         self.last_frontier_count = 0
@@ -453,7 +659,7 @@ class BaselinePlaybackSession:
             action_speed=speed,
             peak_no_progress_streak=max(self.env.peak_no_progress_steps, self.no_progress_streak),
         )
-        committed_state["policy_kind"] = "baseline-legal-mover"
+        committed_state["policy_kind"] = "innate"
         self.pending_states = _build_microstep_frames(committed_state=committed_state, replay_turn=replay_turn)
 
         if self.debug_trace:
@@ -462,62 +668,31 @@ class BaselinePlaybackSession:
                 f"player={committed_state['player_position']} monster={committed_state['monster_position']} outcome={committed_state['outcome']}"
             )
 
-        forced_outcome: str | None = None
-        if time.monotonic() - self.started_at > self.wall_time_timeout_s:
-            forced_outcome = "timeout"
-        elif self.no_progress_streak >= self.max_no_progress_streak:
-            forced_outcome = "no_progress"
-
-        if terminated or truncated or forced_outcome is not None:
-            if terminated or truncated:
-                metrics = info["episode_metrics"]
-                self.pending_result = ShowcaseResult(
-                    checkpoint=self.checkpoint_label,
-                    status="ok",
-                    outcome=metrics.outcome,
-                    escape_rate=1.0 if metrics.outcome == "escaped" else 0.0,
-                    coverage=metrics.coverage,
-                    steps=metrics.steps,
-                    revisits=metrics.revisits,
-                    oscillations=metrics.oscillations,
-                    dead_ends=metrics.dead_end_entries,
-                    start_monster_distance=float(metrics.start_monster_distance),
-                    time_to_capture=float(metrics.time_to_capture) if metrics.time_to_capture is not None else None,
-                    frontier_rate=1.0 if metrics.reached_new_frontier else 0.0,
-                    peak_no_progress_streak=metrics.peak_no_progress_steps,
-                    final_player_position=metrics.final_player_position,
-                    final_monster_position=metrics.final_monster_position,
-                    final_distance=metrics.final_player_monster_distance,
-                    capture_rule=metrics.capture_rule,
-                    final_state=deepcopy(committed_state),
-                    checkpoint_path=None,
-                    seed=self.seed,
-                    notes="baseline legal mover",
-                )
-            else:
-                self.pending_result = ShowcaseResult(
-                    checkpoint=self.checkpoint_label,
-                    status="forced-stop",
-                    outcome=forced_outcome or "timeout",
-                    escape_rate=0.0,
-                    coverage=self.env.coverage,
-                    steps=self.env.step_count,
-                    revisits=self.env.revisits,
-                    oscillations=self.env.oscillations,
-                    dead_ends=self.env.dead_end_entries,
-                    start_monster_distance=float(self.env.start_monster_distance),
-                    time_to_capture=None,
-                    frontier_rate=1.0 if self.env.frontier_cells_visited > 0 else 0.0,
-                    peak_no_progress_streak=max(self.env.peak_no_progress_steps, self.no_progress_streak),
-                    final_player_position=self.env.player.as_tuple() if self.env.player is not None else None,
-                    final_monster_position=self.env.monster.as_tuple() if self.env.monster is not None else None,
-                    final_distance=committed_state.get("player_monster_distance"),
-                    capture_rule=self.env.last_capture_rule,
-                    final_state=deepcopy(committed_state),
-                    checkpoint_path=None,
-                    seed=self.seed,
-                    notes="baseline playback stopped by watchdog",
-                )
+        if terminated or truncated:
+            metrics = info["episode_metrics"]
+            self.pending_result = ShowcaseResult(
+                checkpoint=self.checkpoint_label,
+                status="ok",
+                outcome=metrics.outcome,
+                escape_rate=1.0 if metrics.outcome == "escaped" else 0.0,
+                coverage=metrics.coverage,
+                steps=metrics.steps,
+                revisits=metrics.revisits,
+                oscillations=metrics.oscillations,
+                dead_ends=metrics.dead_end_entries,
+                start_monster_distance=float(metrics.start_monster_distance),
+                time_to_capture=float(metrics.time_to_capture) if metrics.time_to_capture is not None else None,
+                frontier_rate=1.0 if metrics.reached_new_frontier else 0.0,
+                peak_no_progress_streak=metrics.peak_no_progress_steps,
+                final_player_position=metrics.final_player_position,
+                final_monster_position=metrics.final_monster_position,
+                final_distance=metrics.final_player_monster_distance,
+                capture_rule=metrics.capture_rule,
+                final_state=deepcopy(committed_state),
+                checkpoint_path=None,
+                seed=self.seed,
+                notes="innate play",
+            )
         if not self.pending_states:
             self.pending_states = [deepcopy(committed_state)]
         return self.advance()
@@ -530,34 +705,9 @@ class BaselinePlaybackSession:
         return RecordedRun(frames=[deepcopy(frame) for frame in self.recorded_frames], result=self.result)
 
     def _choose_legal_action(self) -> int:
-        """Choose a reproducible non-learning legal move."""
+        """Choose a reproducible non-learning move that favors exploration."""
 
-        if self.env.player is None:
-            return 0
-        legal_actions: list[int] = []
-        for direction in range(4):
-            candidate = self._candidate_for_direction(direction)
-            if self._is_wall(candidate):
-                continue
-            legal_actions.append(direction * self.env.config.max_player_speed)
-        if not legal_actions:
-            return 0
-        return int(self.rng.choice(legal_actions))
-
-    def _candidate_for_direction(self, direction: int) -> Position:
-        delta_row, delta_col = [(-1, 0), (0, 1), (1, 0), (0, -1)][direction]
-        return self.env.player.shifted(delta_row, delta_col)
-
-    def _is_wall(self, position: Position) -> bool:
-        if self.env.layout is None:
-            return True
-        return (
-            position.row < 0
-            or position.col < 0
-            or position.row >= self.env.layout.rows
-            or position.col >= self.env.layout.cols
-            or self.env.layout.grid[position.row][position.col] == "#"
-        )
+        return choose_heuristic_action(self.env)
 
 
 def load_checkpoint_for_playback(checkpoint_path: str | Path) -> tuple[Any, MazeEnv, dict[str, Any]]:
@@ -676,10 +826,18 @@ def run_showcase_headless(
     return results
 
 
-def save_showcase_summary(results: list[ShowcaseResult], seed: int, output_path: str | Path | None = None) -> Path:
+def save_showcase_summary(
+    results: list[ShowcaseResult],
+    seed: int,
+    output_path: str | Path | None = None,
+) -> Path:
     """Write showcase results to a JSON file."""
 
-    output = Path(output_path) if output_path is not None else Path("replays") / f"showcase_seed_{seed}_{int(time.time())}.json"
+    output = (
+        Path(output_path)
+        if output_path is not None
+        else Path("replays") / f"showcase_seed_{seed}_{int(time.time())}.json"
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "seed": seed,
@@ -694,16 +852,19 @@ def format_showcase_table(results: list[ShowcaseResult]) -> list[str]:
     """Build a readable row-per-checkpoint summary table."""
 
     header = (
-        "checkpoint | status | outcome | escape_rate | coverage | steps | revisits | oscillations | "
-        "dead_ends | start_monster_distance | time_to_capture | frontier_rate | peak_no_progress_streak"
+        "checkpoint | status | outcome | escape_rate | coverage | steps | revisits | "
+        "oscillations | dead_ends | start_monster_distance | time_to_capture | "
+        "frontier_rate | peak_no_progress_streak"
     )
     lines = [header]
     for item in results:
         lines.append(
             f"{item.checkpoint} | {item.status} | {item.outcome} | {item.escape_rate:.2f} | "
             f"{item.coverage:.2f} | {item.steps} | {item.revisits} | {item.oscillations} | "
-            f"{item.dead_ends} | {item.start_monster_distance if item.start_monster_distance is not None else 'n/a'} | "
-            f"{item.time_to_capture if item.time_to_capture is not None else 'n/a'} | {item.frontier_rate:.2f} | "
+            f"{item.dead_ends} | "
+            f"{item.start_monster_distance if item.start_monster_distance is not None else 'n/a'} | "
+            f"{item.time_to_capture if item.time_to_capture is not None else 'n/a'} | "
+            f"{item.frontier_rate:.2f} | "
             f"{item.peak_no_progress_streak}"
         )
     return lines

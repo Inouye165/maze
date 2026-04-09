@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import threading
+import time
+from typing import Any, Callable
 
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.monitor import Monitor
@@ -39,6 +41,10 @@ class ImmutableCheckpointCallback(BaseCallback):
         target_episode: int | None = None,
         save_initial_checkpoint: bool = True,
         stop_event: threading.Event | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        report_every_timesteps: int = 100,
+        report_every_seconds: float = 5.0,
+        report_no_progress_steps: int = 10,
     ) -> None:
         super().__init__()
         self.manager = manager
@@ -49,7 +55,16 @@ class ImmutableCheckpointCallback(BaseCallback):
         self.target_episode = target_episode if target_episode is not None else training_config.episodes
         self.save_initial_checkpoint = save_initial_checkpoint
         self.stop_event = stop_event
+        self.progress_callback = progress_callback
+        self.report_every_timesteps = report_every_timesteps
+        self.report_every_seconds = report_every_seconds
+        self.report_no_progress_steps = report_no_progress_steps
         self.last_saved_episode = start_episode if not save_initial_checkpoint else -1
+        self._started_at = time.monotonic()
+        self._current_episode_started_at = self._started_at
+        self._last_progress_timesteps = 0
+        self._last_progress_emit_at = self._started_at
+        self._last_progress_no_progress_steps = -1
 
     def _on_training_start(self) -> None:
         if not self.save_initial_checkpoint:
@@ -74,13 +89,78 @@ class ImmutableCheckpointCallback(BaseCallback):
         )
         self.last_saved_episode = episode
 
+    def _emit_progress(self, info: dict[str, Any] | None, status: str) -> None:
+        if self.progress_callback is None:
+            return
+
+        now = time.monotonic()
+        snapshot = info.get("state_snapshot", {}) if info is not None else {}
+        snapshot_summary = self.summary.snapshot()
+        completed = self.completed_episodes
+        target = max(1, self.target_episode)
+        active_cycle = completed + 1 if status in {"running", "no-progress"} else completed
+        elapsed_seconds = now - self._started_at
+        average_seconds_per_cycle = elapsed_seconds / completed if completed > 0 else None
+        estimated_remaining_seconds = (
+            average_seconds_per_cycle * (target - completed)
+            if average_seconds_per_cycle is not None
+            else None
+        )
+        payload = {
+            "status": status,
+            "completed_episodes": completed,
+            "target_episodes": target,
+            "active_cycle": active_cycle,
+            "progress_ratio": completed / target,
+            "timesteps": self.num_timesteps,
+            "episode_steps": int(snapshot.get("steps", 0)),
+            "coverage": float(info.get("coverage", 0.0)) if info is not None else 0.0,
+            "outcome": info.get("outcome", "running") if info is not None else "running",
+            "no_progress_steps": int(info.get("no_progress_steps", 0)) if info is not None else 0,
+            "peak_no_progress_steps": int(info.get("peak_no_progress_steps", 0)) if info is not None else 0,
+            "repeat_move_streak": int(info.get("repeat_move_streak", 0)) if info is not None else 0,
+            "repeat_loop_detected": bool(info.get("repeat_loop_detected", False)) if info is not None else False,
+            "recent_win_rate": snapshot_summary["recent_win_rate"],
+            "recent_stall_rate": snapshot_summary["recent_stall_rate"],
+            "recent_timeout_rate": snapshot_summary["recent_timeout_rate"],
+            "recent_average_coverage": snapshot_summary["recent_average_coverage"],
+            "elapsed_seconds": elapsed_seconds,
+            "current_episode_elapsed_seconds": now - self._current_episode_started_at,
+            "average_seconds_per_cycle": average_seconds_per_cycle,
+            "estimated_remaining_seconds": estimated_remaining_seconds,
+        }
+        self._last_progress_emit_at = now
+        self.progress_callback(payload)
+
+    def _maybe_emit_step_progress(self, info: dict[str, Any]) -> None:
+        if self.progress_callback is None:
+            return
+
+        no_progress_steps = int(info.get("no_progress_steps", 0))
+        if self.num_timesteps - self._last_progress_timesteps >= self.report_every_timesteps:
+            self._last_progress_timesteps = self.num_timesteps
+            self._last_progress_no_progress_steps = no_progress_steps
+            self._emit_progress(info, status="running")
+            return
+
+        if time.monotonic() - self._last_progress_emit_at >= self.report_every_seconds:
+            self._emit_progress(info, status="running")
+            return
+
+        if no_progress_steps >= self.report_no_progress_steps and no_progress_steps != self._last_progress_no_progress_steps:
+            self._last_progress_no_progress_steps = no_progress_steps
+            self._emit_progress(info, status="no-progress")
+
     def _on_step(self) -> bool:
         infos = self.locals.get("infos", [])
         for info in infos:
+            self._maybe_emit_step_progress(info)
             metrics = info.get("episode_metrics")
             if isinstance(metrics, EpisodeMetrics):
                 self.completed_episodes += 1
                 self.summary.add(metrics)
+                self._emit_progress(info, status=metrics.outcome)
+                self._current_episode_started_at = time.monotonic()
                 if self.manager.should_save(self.completed_episodes):
                     self._save_checkpoint(episode=self.completed_episodes, timesteps=self.num_timesteps)
                 if self.completed_episodes >= self.target_episode:
@@ -104,6 +184,7 @@ def train_from_scratch(
     training_config: TrainingConfig | None = None,
     maze_config: MazeConfig | None = None,
     stop_event: threading.Event | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> TrainingArtifacts:
     """Train a fresh model from episode 0."""
 
@@ -114,7 +195,13 @@ def train_from_scratch(
     manager = CheckpointManager(training_config=training_config, maze_config=maze_config)
     env = build_training_env(maze_config)
     model = create_model(training_config=training_config, env=env)
-    callback = ImmutableCheckpointCallback(manager=manager, training_config=training_config, maze_config=maze_config, stop_event=stop_event)
+    callback = ImmutableCheckpointCallback(
+        manager=manager,
+        training_config=training_config,
+        maze_config=maze_config,
+        stop_event=stop_event,
+        progress_callback=progress_callback,
+    )
     model.learn(total_timesteps=10_000_000, callback=callback, progress_bar=False)
     return TrainingArtifacts(
         checkpoint_dir=training_config.checkpoint_dir,
@@ -128,6 +215,7 @@ def continue_training_from_latest(
     checkpoint_dir: str | Path = "checkpoints",
     training_mode: str = "maze-only",
     stop_event: threading.Event | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> TrainingArtifacts:
     """Continue training from the latest available checkpoint, or start fresh if none exists."""
 
@@ -145,6 +233,7 @@ def continue_training_from_latest(
             ),
             maze_config=base_config,
             stop_event=stop_event,
+            progress_callback=progress_callback,
         )
 
     latest_episode, checkpoint_path = latest
@@ -184,6 +273,7 @@ def continue_training_from_latest(
         target_episode=latest_episode + additional_episodes,
         save_initial_checkpoint=False,
         stop_event=stop_event,
+        progress_callback=progress_callback,
     )
     model.learn(total_timesteps=10_000_000, callback=callback, progress_bar=False, reset_num_timesteps=False)
     return TrainingArtifacts(
@@ -202,7 +292,7 @@ def maze_config_for_training_mode(maze_config: MazeConfig, training_mode: str) -
         raise ValueError(f"Unsupported training mode: {training_mode}")
 
     reward = RewardConfig(
-        survival_reward=-0.05,
+        survival_reward=-0.08,
         exploration_reward=2.5,
         frontier_reward=1.0,
         revisit_penalty=-0.6,
@@ -210,9 +300,9 @@ def maze_config_for_training_mode(maze_config: MazeConfig, training_mode: str) -
         oscillation_penalty=-1.5,
         dead_end_penalty=-0.3,
         blocked_move_penalty=-2.0,
-        exit_progress_reward=2.0,
-        safety_gain_reward=1.0,
-        safety_loss_penalty=-1.5,
+        exit_progress_reward=1.6,
+        safety_gain_reward=1.8,
+        safety_loss_penalty=-3.2,
         win_reward=100.0,
         caught_penalty=-50.0,
         timeout_penalty=-10.0,
@@ -221,15 +311,49 @@ def maze_config_for_training_mode(maze_config: MazeConfig, training_mode: str) -
     return MazeConfig(
         **{
             **maze_config.__dict__,
-            "rows": 10,
-            "cols": 10,
+            "rows": 19,
+            "cols": 19,
             "max_player_speed": 1,
             "monster_speed": 1,
             "monster_activation_delay": 0,
             "monster_move_interval": 3,
-            "max_episode_steps": 120,
-            "stall_threshold": 40,
+            "max_episode_steps": 280,
+            "stall_threshold": 90,
             "curriculum_enabled": False,
             "reward": reward,
         }
+    )
+
+
+def format_training_progress(progress: dict[str, Any]) -> str:
+    """Format a compact progress line for CLI and app status surfaces."""
+
+    completed = int(progress.get("completed_episodes", 0))
+    target = max(1, int(progress.get("target_episodes", 1)))
+    progress_pct = 100.0 * completed / target
+    active_cycle = int(progress.get("active_cycle", completed))
+    episode_steps = int(progress.get("episode_steps", 0))
+    no_progress_steps = int(progress.get("no_progress_steps", 0))
+    peak_no_progress_steps = int(progress.get("peak_no_progress_steps", 0))
+    coverage = float(progress.get("coverage", 0.0))
+    recent_win_rate = float(progress.get("recent_win_rate", 0.0))
+    recent_stall_rate = float(progress.get("recent_stall_rate", 0.0))
+    recent_timeout_rate = float(progress.get("recent_timeout_rate", 0.0))
+    status = str(progress.get("status", "running"))
+    extra = f" | cycle {active_cycle} | move {episode_steps}"
+    if status == "no-progress" or no_progress_steps > 0:
+        extra += " | no-progress"
+    if progress.get("repeat_loop_detected"):
+        extra += " | repeat-loop"
+    return (
+        f"training {completed}/{target} ({progress_pct:.1f}%)"
+        f" | steps={episode_steps}"
+        f" | timesteps={int(progress.get('timesteps', 0))}"
+        f" | coverage={coverage:.2f}"
+        f" | no_progress={no_progress_steps}"
+        f" | peak_no_progress={peak_no_progress_steps}"
+        f" | recent_win_rate={recent_win_rate:.2f}"
+        f" | recent_stall_rate={recent_stall_rate:.2f}"
+        f" | recent_timeout_rate={recent_timeout_rate:.2f}"
+        f"{extra}"
     )

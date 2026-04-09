@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import inspect
 import shutil
 import threading
 import time
@@ -14,9 +15,17 @@ from typing import Any, Callable
 import pygame
 
 from maze_rl.config import MazeConfig, maze_config_from_dict
+from maze_rl.render.view_state import (
+    viewer_cell_color,
+    viewer_exit_position,
+    viewer_grid,
+    viewer_monster_position,
+    viewer_player_position,
+    viewer_visible_cells,
+)
 from maze_rl.training.checkpointing import checkpoint_is_complete, latest_checkpoint, list_checkpoints, load_checkpoint_metadata, resolve_checkpoint_path
 from maze_rl.training.showcase import BaselinePlaybackSession, PlaybackSession, RecordedPlaybackSession, RecordedRun, ShowcaseResult, build_missing_result
-from maze_rl.training.train import continue_training_from_latest, maze_config_for_training_mode
+from maze_rl.training.train import continue_training_from_latest, format_training_progress, maze_config_for_training_mode
 
 QUIT = getattr(pygame, "QUIT", 256)
 MOUSEBUTTONDOWN = getattr(pygame, "MOUSEBUTTONDOWN", 1025)
@@ -82,6 +91,7 @@ class LabAppController:
         self.training_status = "idle"
         self.training_message = "ready"
         self.training_error: str | None = None
+        self.training_progress: dict[str, Any] | None = None
         self.cycle_input_text = "1"
         self.last_training_increment = 100
         self.compare_queue: list[CompareRunEntry] = []
@@ -211,7 +221,7 @@ class LabAppController:
         self._clear_compare_state()
         self.session = BaselinePlaybackSession(
             maze_config=maze_config,
-            checkpoint_label="baseline legal mover",
+            checkpoint_label="innate",
             seed=seed,
             debug_trace=self.debug_trace,
         )
@@ -220,7 +230,7 @@ class LabAppController:
         self.last_result = None
         self.last_state = self.session.latest_state
         self.paused = False
-        self.training_message = f"running baseline legal mover on seed {seed}"
+        self.training_message = f"running innate play on seed {seed}"
 
     def start_current_ai_run(self) -> None:
         """Run one frozen episode using the selected checkpoint."""
@@ -246,12 +256,20 @@ class LabAppController:
         self.last_result = None
         self.last_state = self.session.latest_state
         self.paused = False
-        self.training_message = f"running current AI from ckpt {episode:04d} on seed {seed}"
+        self.training_message = f"running trained play from ckpt {episode:04d} on seed {seed}"
+
+    def start_play(self) -> None:
+        """Run the active play mode: innate without checkpoints, trained otherwise."""
+
+        if self.selected_checkpoint is None:
+            self.start_baseline_legal_mover()
+            return
+        self.start_current_ai_run()
 
     def start_marks_play(self) -> None:
-        """Run the learned policy using the latest selected training checkpoint."""
+        """Backward-compatible alias for the plain-English Play action."""
 
-        self.start_current_ai_run()
+        self.start_play()
 
     def replay_last_run(self) -> None:
         """Replay the previous recorded event stream exactly."""
@@ -340,17 +358,26 @@ class LabAppController:
         self.training_stop_event = threading.Event()
         self.training_status = "running"
         self.training_error = None
+        self.training_progress = None
         self.current_mode = "training"
         self.training_message = f"training +{additional_episodes} episodes in {self.training_mode}"
 
+        def _report_progress(progress: dict[str, Any]) -> None:
+            self.training_progress = progress
+            self.training_message = format_training_progress(progress)
+
+        training_kwargs = {
+            "additional_episodes": additional_episodes,
+            "checkpoint_dir": self.active_checkpoint_dir,
+            "training_mode": self.training_mode,
+            "stop_event": self.training_stop_event,
+        }
+        if "progress_callback" in inspect.signature(continue_training_from_latest).parameters:
+            training_kwargs["progress_callback"] = _report_progress
+
         def _worker() -> None:
             try:
-                continue_training_from_latest(
-                    additional_episodes=additional_episodes,
-                    checkpoint_dir=self.active_checkpoint_dir,
-                    training_mode=self.training_mode,
-                    stop_event=self.training_stop_event,
-                )
+                continue_training_from_latest(**training_kwargs)
             except (OSError, RuntimeError, ValueError) as error:  # pragma: no cover - surfaced in app status
                 self.training_error = str(error)
                 self.training_message = f"training error: {error}"
@@ -391,6 +418,7 @@ class LabAppController:
         self.last_state = None
         self.training_error = None
         self.training_status = "idle"
+        self.training_progress = None
         self.current_mode = "idle"
         self.selected_mode = "baseline-legal-mover"
         self.paused = False
@@ -448,7 +476,7 @@ class LabAppController:
         if result is None:
             return
         self.last_result = result
-        if hasattr(active_session, "build_recorded_run"):
+        if isinstance(active_session, (PlaybackSession, BaselinePlaybackSession)):
             self.last_recorded_run = active_session.build_recorded_run()
         self.session = None
         self.paused = False
@@ -492,7 +520,6 @@ class LabAppController:
         if selected is not None:
             metadata = load_checkpoint_metadata(selected[1])
             return maze_config_from_dict(metadata["maze_config"])
-        latest = latest_checkpoint(self.checkpoint_dir)
         latest = latest_checkpoint(self.active_checkpoint_dir)
         if latest is not None:
             metadata = load_checkpoint_metadata(latest[1])
@@ -502,8 +529,8 @@ class LabAppController:
     def mode_label(self) -> str:
         labels = {
             "idle": "Idle",
-            "baseline-legal-mover": "Innate Play",
-            "current-learned-ai": "Marks Play",
+            "baseline-legal-mover": "Innate",
+            "current-learned-ai": "Trained",
             "training": "Training",
             "replay": "Replay",
             "compare-milestones": "Compare Milestones",
@@ -515,8 +542,8 @@ class LabAppController:
 
     def selected_mode_label(self) -> str:
         labels = {
-            "baseline-legal-mover": "Watch Innate Play",
-            "current-learned-ai": "Marks Play",
+            "baseline-legal-mover": "Play Innate",
+            "current-learned-ai": "Play Trained",
             "replay": "Replay Last Run",
             "compare-milestones": "Auto Compare Milestones",
         }
@@ -536,9 +563,30 @@ class LabAppController:
         return f"{completed + running}/{total}"
 
     def has_marks_policy(self) -> bool:
-        """Return whether a learned checkpoint is available for Marks Play."""
+        """Return whether a trained checkpoint is available for Play."""
 
         return self.selected_checkpoint is not None
+
+    def play_mode_status(self) -> str:
+        """Return the small plain-English mode label shown near Play."""
+
+        selected = self.selected_checkpoint
+        if selected is None:
+            return "Mode: Innate"
+        return f"Mode: Trained (ckpt {selected[0]:04d})"
+
+    def all_time_training_card(self) -> TrainingStatCard:
+        """Return the compact all-time training summary for the Basic tab."""
+
+        return self._build_training_stat_card("All Time", self.latest_training_summary(), None)
+
+    def recent_10_outcomes(self) -> list[str]:
+        """Return the latest ten outcomes for the compact recent row."""
+
+        summary = self.latest_training_summary()
+        if summary is None:
+            return []
+        return self._summary_outcomes(summary, 10)
 
     def training_stat_cards(self) -> list[TrainingStatCard]:
         """Return training outcome cards for last 10, last 50, and all-time."""
@@ -554,17 +602,57 @@ class LabAppController:
         """Return concise status lines for the basic tab."""
 
         latest_summary = self.latest_training_summary()
-        selected = self.selected_checkpoint
         last_outcome = self.last_result.outcome if self.last_result is not None else "none yet"
-        checkpoint_label = "none" if selected is None else f"ckpt {selected[0]:04d}"
         cycles_seen = 0 if latest_summary is None else int(latest_summary.get("episodes_seen", 0))
         return [
             f"Seed: {self.parse_seed()} | Train cycles: {self.parse_cycle_count()}",
-            f"Now showing: {self.mode_label()} | Last outcome: {last_outcome}",
-            f"Marks checkpoint: {checkpoint_label} | Training mode: {self.training_mode_label()}",
+            f"Play mode: {self.play_mode_status()} | Last outcome: {last_outcome}",
+            f"Training mode: {self.training_mode_label()} | Current view: {self.mode_label()}",
             f"Training status: {self.training_status} | Cycles completed: {cycles_seen}",
             f"Status: {self.training_message}",
         ]
+
+    def training_progress_summary(self) -> str:
+        """Return one compact line for the current training progress."""
+
+        progress = self.training_progress
+        if not progress:
+            return "Training progress: idle"
+
+        completed = int(progress.get("completed_episodes", 0))
+        target = max(1, int(progress.get("target_episodes", 1)))
+        percent = 100.0 * completed / target
+        active_cycle = int(progress.get("active_cycle", completed))
+        episode_steps = int(progress.get("episode_steps", 0))
+        parts = [f"Training progress: cycle {active_cycle} | move {episode_steps} | {completed}/{target} ({percent:.1f}%)"]
+
+        current_seconds = progress.get("current_episode_elapsed_seconds")
+        if isinstance(current_seconds, (int, float)):
+            parts.append(f"cycle {current_seconds:.0f}s")
+
+        average_seconds = progress.get("average_seconds_per_cycle")
+        if isinstance(average_seconds, (int, float)):
+            parts.append(f"avg {average_seconds:.1f}s/cycle")
+
+        eta_seconds = progress.get("estimated_remaining_seconds")
+        if isinstance(eta_seconds, (int, float)):
+            parts.append(f"eta {eta_seconds / 60.0:.1f}m")
+
+        no_progress_steps = int(progress.get("no_progress_steps", 0))
+        if no_progress_steps > 0:
+            parts.append(f"no-progress {no_progress_steps}")
+
+        return " | ".join(parts)
+
+    def training_progress_ratio(self) -> float:
+        """Return a 0..1 completion ratio for the active training run."""
+
+        progress = self.training_progress
+        if not progress:
+            return 0.0
+        completed = int(progress.get("completed_episodes", 0))
+        target = max(1, int(progress.get("target_episodes", 1)))
+        return max(0.0, min(1.0, completed / target))
 
     def summary_lines(self) -> list[str]:
         """Return compact app summary lines for the side panel."""
@@ -632,9 +720,9 @@ class LabAppController:
         return summary if isinstance(summary, dict) else None
 
     def _active_policy_label(self) -> str:
-        """Describe the current learned policy stage."""
+        """Describe the current play mode in plain English."""
 
-        return "Marks Play" if self.training_mode == "maze-only" else "Marks Play"
+        return self.play_mode_status()
 
     def _build_training_stat_card(
         self,
@@ -719,13 +807,23 @@ class LabControlApp:
                 self._running = False
 
             self.controller.update()
-            self.buttons = self._build_buttons()
+            self.buttons = self.build_buttons()
             self._draw(screen)
             pygame.display.flip()
             clock.tick(self.controller.fps if self.controller.session is not None else 30)
 
         pygame.display.quit()
         pygame.font.quit()
+
+    def build_buttons(self) -> list[Button]:
+        """Return the currently visible buttons for the active tab."""
+
+        return self._build_buttons()
+
+    def visible_button_labels(self) -> list[str]:
+        """Return the currently visible button labels for lightweight UI tests."""
+
+        return [button.label for button in self.build_buttons()]
 
     def _handle_click(self, position: tuple[int, int]) -> None:
         if self.seed_input_rect.collidepoint(position):
@@ -786,80 +884,31 @@ class LabControlApp:
         content = layout["content"]
         if self.active_tab == "basic":
             actions_y = content.y + 126
-            primary_width = (content.width - 24 - 24) // 3
-            train_cycles = self.controller.parse_cycle_count()
-            has_marks_policy = self.controller.has_marks_policy()
+            play_width = 216
+            train_width = 116
+            reset_width = 136
             buttons.extend(
                 [
                     Button(
-                        "Play Innate",
-                        pygame.Rect(content.x + 12, actions_y, primary_width, 44),
-                        self.controller.start_baseline_legal_mover,
+                        "Play",
+                        pygame.Rect(content.x + 12, actions_y, play_width, 54),
+                        self.controller.start_play,
                         enabled=self.controller.can_start_run,
+                        kind="primary",
+                    ),
+                    Button(
+                        "Train",
+                        pygame.Rect(content.x + 12 + play_width + 12, actions_y + 5, train_width, 44),
+                        lambda: self.controller.start_training(self.controller.parse_cycle_count()),
+                        enabled=not self.controller.is_training_active and self.controller.session is None,
                         kind="default",
                     ),
                     Button(
-                        "Marks Play" if has_marks_policy else (f"Train {train_cycles} Cycle" if train_cycles == 1 else f"Train {train_cycles} Cycles"),
-                        pygame.Rect(content.x + 12 + primary_width + 12, actions_y, primary_width, 44),
-                        self.controller.start_marks_play if has_marks_policy else (lambda: self.controller.start_training(self.controller.parse_cycle_count())),
-                        enabled=self.controller.can_start_run if has_marks_policy else (not self.controller.is_training_active and self.controller.session is None),
-                        kind="primary" if has_marks_policy else "accent",
-                    ),
-                    Button(
-                        f"Train {train_cycles} More" if has_marks_policy else "Marks Play",
-                        pygame.Rect(content.x + 12 + 2 * (primary_width + 12), actions_y, primary_width, 44),
-                        lambda: self.controller.start_training(self.controller.parse_cycle_count()) if has_marks_policy else self.controller.start_marks_play(),
-                        enabled=(not self.controller.is_training_active and self.controller.session is None) if has_marks_policy else (self.controller.can_start_run and self.controller.has_marks_policy()),
-                        kind="accent",
-                    ),
-                    Button(
-                        "Pause",
-                        pygame.Rect(content.x + 12, actions_y + 58, 108, row_height),
-                        self.controller.pause,
-                        enabled=self.controller.session is not None and not self.controller.paused,
-                    ),
-                    Button(
-                        "Resume",
-                        pygame.Rect(content.x + 132, actions_y + 58, 108, row_height),
-                        self.controller.resume,
-                        enabled=self.controller.session is not None and self.controller.paused,
-                    ),
-                    Button(
-                        "Step",
-                        pygame.Rect(content.x + 252, actions_y + 58, 108, row_height),
-                        self.controller.step_once,
-                        enabled=not self.controller.is_training_active,
-                    ),
-                    Button(
-                        "Reset",
-                        pygame.Rect(content.x + 372, actions_y + 58, 108, row_height),
-                        self.controller.reset,
-                        enabled=self.controller.session is not None or self.controller.last_state is not None,
-                    ),
-                    Button(
-                        "Slow",
-                        pygame.Rect(content.x + 12, actions_y + 104, 92, row_height),
-                        lambda: self.controller.set_speed_index(0),
-                        active=self.controller.speed_index == 0,
-                    ),
-                    Button(
-                        "Normal",
-                        pygame.Rect(content.x + 116, actions_y + 104, 92, row_height),
-                        lambda: self.controller.set_speed_index(1),
-                        active=self.controller.speed_index == 1,
-                    ),
-                    Button(
-                        "Fast",
-                        pygame.Rect(content.x + 220, actions_y + 104, 92, row_height),
-                        lambda: self.controller.set_speed_index(2),
-                        active=self.controller.speed_index == 2,
-                    ),
-                    Button(
                         "Reset Training",
-                        pygame.Rect(content.x + 324, actions_y + 104, 156, row_height),
+                        pygame.Rect(content.x + 12 + play_width + 12 + train_width + 12, actions_y + 5, reset_width, 44),
                         self.controller.reset_training,
                         enabled=not self.controller.is_training_active and self.controller.session is None,
-                        kind="accent",
+                        kind="danger",
                     ),
                 ]
             )
@@ -867,34 +916,58 @@ class LabControlApp:
             buttons.extend(
                 [
                     Button(
+                        "Pause",
+                        pygame.Rect(content.x + 12, content.y + 72, 102, row_height),
+                        self.controller.pause,
+                        enabled=self.controller.session is not None and not self.controller.paused,
+                    ),
+                    Button(
+                        "Resume",
+                        pygame.Rect(content.x + 126, content.y + 72, 102, row_height),
+                        self.controller.resume,
+                        enabled=self.controller.session is not None and self.controller.paused,
+                    ),
+                    Button(
+                        "Step",
+                        pygame.Rect(content.x + 240, content.y + 72, 102, row_height),
+                        self.controller.step_once,
+                        enabled=not self.controller.is_training_active,
+                    ),
+                    Button(
+                        "Reset Run",
+                        pygame.Rect(content.x + 354, content.y + 72, 110, row_height),
+                        self.controller.reset,
+                        enabled=self.controller.session is not None or self.controller.last_state is not None,
+                    ),
+                    Button(
                         "Replay Last Run",
-                        pygame.Rect(content.x + 12, content.y + 72, 220, 40),
+                        pygame.Rect(content.x + 12, content.y + 122, 220, 40),
                         self.controller.replay_last_run,
                         enabled=self.controller.can_start_run and self.controller.last_recorded_run is not None,
                         kind="primary",
                     ),
                     Button(
                         "Compare Milestones",
-                        pygame.Rect(content.x + 244, content.y + 72, 220, 40),
+                        pygame.Rect(content.x + 244, content.y + 122, 220, 40),
                         self.controller.start_compare_milestones,
                         enabled=self.controller.can_start_run,
                         kind="accent",
                     ),
                     Button(
                         "Previous Ckpt",
-                        pygame.Rect(content.x + 12, content.y + 128, 140, row_height),
+                        pygame.Rect(content.x + 12, content.y + 178, 140, row_height),
                         lambda: self.controller.cycle_checkpoint(-1),
                         enabled=bool(self.controller.available_checkpoints) and self.controller.can_start_run,
                     ),
                     Button(
                         "Next Ckpt",
-                        pygame.Rect(content.x + 164, content.y + 128, 140, row_height),
+                        pygame.Rect(content.x + 164, content.y + 178, 140, row_height),
                         lambda: self.controller.cycle_checkpoint(1),
                         enabled=bool(self.controller.available_checkpoints) and self.controller.can_start_run,
                     ),
                     Button(
                         "Latest",
-                        pygame.Rect(content.x + 316, content.y + 128, 148, row_height),
+                        pygame.Rect(content.x + 316, content.y + 178, 148, row_height),
                         self.controller.use_latest_checkpoint,
                         enabled=bool(self.controller.available_checkpoints) and self.controller.can_start_run,
                     ),
@@ -929,9 +1002,9 @@ class LabControlApp:
                         enabled=self.controller.can_start_run,
                     ),
                     Button(
-                        "Marks Play",
+                        "Play Trained",
                         pygame.Rect(content.x + 164, content.y + 128, 140, row_height),
-                        self.controller.start_marks_play,
+                        self.controller.start_current_ai_run,
                         enabled=self.controller.can_start_run and self.controller.has_marks_policy(),
                     ),
                     Button(
@@ -963,7 +1036,7 @@ class LabControlApp:
         if state is None or not state.get("grid"):
             title = self.title_font.render("Watch the maze before training", True, (46, 57, 71))
             screen.blit(title, (self.game_area.x + 30, self.game_area.y + 30))
-            subtitle = self.font.render("Start with Watch Innate, then train by cycles, then use Marks Play to test learned behavior.", True, (106, 116, 128))
+            subtitle = self.font.render("Press Play to use the active model, then train by cycles and review the result.", True, (106, 116, 128))
             screen.blit(subtitle, (self.game_area.x + 30, self.game_area.y + 72))
             tip_lines = [
                 "The basic tab keeps only the core flow visible.",
@@ -979,7 +1052,8 @@ class LabControlApp:
             )
             return
 
-        grid = state["grid"]
+        grid = viewer_grid(state)
+        visible_cells = viewer_visible_cells(state)
         rows = len(grid)
         cols = len(grid[0])
         cell_size = min((self.game_area.width - 64) // cols, (self.game_area.height - 224) // rows)
@@ -990,24 +1064,23 @@ class LabControlApp:
         for row_index, row in enumerate(grid):
             for col_index, cell in enumerate(row):
                 rect = pygame.Rect(offset_x + col_index * cell_size, offset_y + row_index * cell_size, cell_size - 1, cell_size - 1)
-                if cell == "#":
-                    color = (88, 98, 112)
-                elif cell == "?":
-                    color = (188, 182, 171)
-                else:
-                    color = (246, 243, 236)
+                color = viewer_cell_color(cell, (row_index, col_index) in visible_cells)
                 pygame.draw.rect(screen, color, rect)
 
-        rendered_player = tuple(state.get("rendered_player_position", state["player_position"]))
-        rendered_monster = tuple(state.get("rendered_monster_position", state["monster_position"]))
-        monster_visible = bool(state.get("monster_visible", True))
-        if monster_visible and rendered_player == rendered_monster:
+        player_visible = bool(state.get("player_visible", True))
+        rendered_player = viewer_player_position(state)
+        rendered_monster = viewer_monster_position(state)
+        exit_position = viewer_exit_position(state)
+        npc_monster_visible = bool(state.get("monster_visible", True))
+        if player_visible and rendered_player is not None and rendered_monster is not None and rendered_player == rendered_monster:
             self._draw_overlap_entities(screen, board_rect, cell_size, rendered_player)
         else:
-            self._draw_entity(screen, board_rect, cell_size, rendered_player, (60, 110, 220), "H", "Human AI")
-            if monster_visible:
+            if player_visible and rendered_player is not None:
+                self._draw_entity(screen, board_rect, cell_size, rendered_player, (60, 110, 220), "H", "Human AI")
+            if rendered_monster is not None:
                 self._draw_entity(screen, board_rect, cell_size, rendered_monster, (205, 60, 60), "M", "Monster")
-        self._draw_entity(screen, board_rect, cell_size, tuple(state["exit_position"]), (77, 145, 95), "E", "Exit")
+        if exit_position is not None:
+            self._draw_entity(screen, board_rect, cell_size, exit_position, (77, 145, 95), "E", "Exit")
 
         overlay_rect = pygame.Rect(self.game_area.x + 24, board_rect.bottom + 18, self.game_area.width - 48, self.game_area.bottom - board_rect.bottom - 32)
         pygame.draw.rect(screen, (244, 239, 229), overlay_rect, border_radius=18)
@@ -1015,8 +1088,8 @@ class LabControlApp:
         overlay_lines = [
             f"Mode: {self.controller.mode_label()} | Seed: {state.get('seed')} | Checkpoint: {state.get('checkpoint_label')}",
             f"Turn: {state.get('turn_step', state.get('steps'))} | Outcome: {state.get('outcome')} | Coverage: {state.get('coverage', 0.0):.2f}",
-            f"Human: {state.get('rendered_player_position', state.get('player_position'))} | Monster: {state.get('rendered_monster_position', state.get('monster_position')) if monster_visible else 'hidden'} | Exit: {state.get('exit_position')}",
-            f"Seen cells: {state.get('discovered_cells', 0)} | Monster visible: {state.get('monster_visible', False)} | Exit seen: {state.get('exit_seen', False)}",
+            f"Human: {rendered_player if player_visible else 'hidden'} | Monster: {rendered_monster} | Exit: {exit_position}",
+            f"Seen cells: {state.get('discovered_cells', 0)} | Vision-shaded cells: {len(visible_cells)} | NPC sees monster: {npc_monster_visible} | Exit seen: {state.get('exit_seen', False)}",
             f"Distance: {state.get('player_monster_distance')} | Repeat streak: {state.get('repeat_move_streak', 0)} | Micro-step: {state.get('current_micro_step', 0)}/{state.get('micro_step_count', 0)} | Speed: {self.controller.speed_options[self.controller.speed_index][0]}",
         ]
         if self.controller.last_result is not None:
@@ -1041,7 +1114,7 @@ class LabControlApp:
 
         title = self.title_font.render("Maze Lab Control", True, (44, 54, 67))
         screen.blit(title, (self.panel_area.x + 18, self.panel_area.y + 18))
-        subtitle = self.small_font.render("A simpler flow: watch innate behavior, train by cycles, then test with Marks Play.", True, (108, 118, 128))
+        subtitle = self.small_font.render("A simpler flow: Play, Train, then review runs when you need detail.", True, (108, 118, 128))
         screen.blit(subtitle, (self.panel_area.x + 18, self.panel_area.y + 52))
 
         if self.active_tab == "basic":
@@ -1056,64 +1129,45 @@ class LabControlApp:
         screen.set_clip(previous_clip)
 
     def _draw_basic_tab(self, screen: Any, rect: pygame.Rect) -> None:
-        has_marks_policy = self.controller.has_marks_policy()
-        hero_rect = pygame.Rect(rect.x, rect.y, rect.width, 104)
-        controls_rect = pygame.Rect(rect.x, hero_rect.bottom + 14, rect.width, 228)
-        stats_rect = pygame.Rect(rect.x, controls_rect.bottom + 14, rect.width, 170)
-        status_rect = pygame.Rect(rect.x, stats_rect.bottom + 14, rect.width, 138)
-        notes_rect = pygame.Rect(rect.x, status_rect.bottom + 14, rect.width, 108)
+        hero_rect = pygame.Rect(rect.x, rect.y, rect.width, 178)
+        stats_rect = pygame.Rect(rect.x, hero_rect.bottom + 18, rect.width, 156)
+        progress_rect = pygame.Rect(rect.x, stats_rect.bottom + 18, rect.width, 96)
+        status_rect = pygame.Rect(rect.x, progress_rect.bottom + 18, rect.width, 92)
 
-        self._draw_card(screen, hero_rect, "Session Setup")
+        self._draw_card(screen, hero_rect, "Play The Maze")
         helper_lines = [
             "Use one seed to make behavior comparisons obvious.",
             "A cycle is one full game. Start with 1 to see immediate cause and effect.",
         ]
-        self._draw_wrapped_text(screen, self.small_font, helper_lines, (101, 109, 120), pygame.Rect(hero_rect.x + 14, hero_rect.y + 36, hero_rect.width - 28, 34), line_gap=2)
-        self.seed_input_rect = pygame.Rect(hero_rect.x + 14, hero_rect.y + 66, 120, 30)
-        self.cycle_input_rect = pygame.Rect(hero_rect.x + 160, hero_rect.y + 66, 96, 30)
+        self._draw_wrapped_text(screen, self.small_font, helper_lines, (101, 109, 120), pygame.Rect(hero_rect.x + 14, hero_rect.y + 38, hero_rect.width - 28, 34), line_gap=2)
+        self.seed_input_rect = pygame.Rect(hero_rect.x + 14, hero_rect.y + 92, 120, 34)
+        self.cycle_input_rect = pygame.Rect(hero_rect.x + 160, hero_rect.y + 92, 96, 34)
         self._draw_input(screen, self.seed_input_rect, "Seed", self.controller.seed_text, self.active_input == "seed")
         self._draw_input(screen, self.cycle_input_rect, "Cycles", self.controller.cycle_input_text, self.active_input == "cycles")
 
-        self._draw_card(screen, controls_rect, "Core Flow")
-        caption = (
-            "A trained checkpoint exists. Use Marks Play to run the learned version, or Play Innate to compare against the untrained behavior."
-            if has_marks_policy
-            else "Start with innate play. Train by cycles. Once training finishes, the main button changes to Marks Play for the learned version."
-        )
-        self._draw_wrapped_text(screen, self.small_font, [caption], (101, 109, 120), pygame.Rect(controls_rect.x + 14, controls_rect.y + 38, controls_rect.width - 28, 28), line_gap=2)
-        reset_hint = "Reset Training clears saved checkpoints so Marks Play returns to innate-only behavior until you train again."
-        self._draw_wrapped_text(screen, self.small_font, [reset_hint], (101, 109, 120), pygame.Rect(controls_rect.x + 14, controls_rect.y + 176, controls_rect.width - 28, 32), line_gap=2)
+        mode_surface = self.heading_font.render(self.controller.play_mode_status(), True, (57, 97, 151))
+        screen.blit(mode_surface, (hero_rect.x + 14, hero_rect.y + 138))
+        helper_surface = self.small_font.render("Play always uses the active model for this training mode.", True, (101, 109, 120))
+        screen.blit(helper_surface, (hero_rect.x + 14, hero_rect.y + 162))
 
-        self._draw_card(screen, stats_rect, "Training Scoreboard")
-        self._draw_training_cards(screen, stats_rect)
+        self._draw_card(screen, stats_rect, "Training Summary")
+        self._draw_basic_training_summary(screen, stats_rect)
 
-        self._draw_card(screen, status_rect, "Current Status")
+        self._draw_card(screen, progress_rect, "Training Progress")
+        self._draw_training_progress(screen, progress_rect)
+
+        self._draw_card(screen, status_rect, "Status")
         self._draw_wrapped_text(screen, self.font, self.controller.primary_status_lines(), (56, 64, 76), pygame.Rect(status_rect.x + 14, status_rect.y + 38, status_rect.width - 28, status_rect.height - 50), line_gap=4)
 
-        self._draw_card(screen, notes_rect, "Legend")
-        legend_items = [
-            ("Human AI", (60, 110, 220), "H"),
-            ("Monster", (205, 60, 60), "M"),
-            ("Exit", (77, 145, 95), "E"),
-        ]
-        for index, (label, color, letter) in enumerate(legend_items):
-            item_x = notes_rect.x + 14 + index * 154
-            swatch = pygame.Rect(item_x, notes_rect.y + 42, 30, 30)
-            pygame.draw.rect(screen, color, swatch, border_radius=8)
-            glyph = self.font.render(letter, True, (255, 255, 255))
-            screen.blit(glyph, (swatch.centerx - glyph.get_width() / 2, swatch.centery - glyph.get_height() / 2))
-            label_surface = self.small_font.render(label, True, (58, 66, 78))
-            screen.blit(label_surface, (item_x + 40, notes_rect.y + 49))
-
     def _draw_review_tab(self, screen: Any, rect: pygame.Rect) -> None:
-        review_rect = pygame.Rect(rect.x, rect.y, rect.width, 186)
+        review_rect = pygame.Rect(rect.x, rect.y, rect.width, 238)
         summary_rect = pygame.Rect(rect.x, review_rect.bottom + 14, rect.width, 238)
         detail_rect = pygame.Rect(rect.x, summary_rect.bottom + 14, rect.width, 232)
 
-        self._draw_card(screen, review_rect, "Replay And Compare")
+        self._draw_card(screen, review_rect, "Review")
         lines = [
             "Review puts the extra tools behind a tab so the default screen stays focused.",
-            "Replay the last run exactly or compare checkpoints on the same seed.",
+            "Pause, step, replay, and compare checkpoints on the same seed.",
         ]
         self._draw_wrapped_text(screen, self.small_font, lines, (101, 109, 120), pygame.Rect(review_rect.x + 14, review_rect.y + 38, review_rect.width - 28, 32), line_gap=2)
 
@@ -1175,6 +1229,67 @@ class LabControlApp:
             ]
             self._draw_wrapped_text(screen, self.small_font, stats, (50, 58, 69), pygame.Rect(card_rect.x + 12, card_rect.y + 30, card_rect.width - 24, card_rect.height - 36), line_gap=2)
 
+    def _draw_basic_training_summary(self, screen: Any, rect: pygame.Rect) -> None:
+        """Draw the compact all-time summary and last-ten row for the Basic tab."""
+
+        card = self.controller.all_time_training_card()
+        label_color = (91, 99, 110)
+        value_color = (50, 58, 69)
+        labels = ["All-time cycles", "Wins", "Losses", "Win %"]
+        values = [str(card.cycles), str(card.wins), str(card.losses), f"{card.percentage * 100:.0f}%"]
+        column_width = (rect.width - 28) // 4
+        for index, (label, value) in enumerate(zip(labels, values, strict=True)):
+            item_x = rect.x + 14 + index * column_width
+            label_surface = self.small_font.render(label, True, label_color)
+            value_surface = self.heading_font.render(value, True, value_color)
+            screen.blit(label_surface, (item_x, rect.y + 44))
+            screen.blit(value_surface, (item_x, rect.y + 68))
+
+        recent = self.controller.recent_10_outcomes()
+        recent_label = self.small_font.render("Last 10", True, label_color)
+        screen.blit(recent_label, (rect.x + 14, rect.y + 112))
+        if recent:
+            symbols = " ".join("W" if item == "escaped" else "L" for item in recent)
+            recent_surface = self.small_font.render(symbols, True, value_color)
+        else:
+            recent_surface = self.small_font.render("No completed cycles yet", True, value_color)
+        screen.blit(recent_surface, (rect.x + 74, rect.y + 112))
+
+    def _draw_training_progress(self, screen: Any, rect: pygame.Rect) -> None:
+        """Draw the live training progress bar and timing hint."""
+
+        progress = self.controller.training_progress
+        ratio = self.controller.training_progress_ratio()
+        label_surface = self.small_font.render(self.controller.training_progress_summary(), True, (56, 64, 76))
+        screen.blit(label_surface, (rect.x + 14, rect.y + 18))
+
+        bar_rect = pygame.Rect(rect.x + 14, rect.y + 44, rect.width - 28, 18)
+        pygame.draw.rect(screen, (233, 227, 216), bar_rect, border_radius=9)
+        fill_width = int(bar_rect.width * ratio)
+        if fill_width > 0:
+            fill_color = (57, 97, 151)
+            if progress is not None and progress.get("status") == "no-progress":
+                fill_color = (188, 119, 58)
+            fill_rect = pygame.Rect(bar_rect.x, bar_rect.y, max(8, fill_width), bar_rect.height)
+            pygame.draw.rect(screen, fill_color, fill_rect, border_radius=9)
+        pygame.draw.rect(screen, (200, 191, 177), bar_rect, width=1, border_radius=9)
+
+        if progress is None:
+            hint = "Start training to watch the bar fill and the cycle age update."
+        else:
+            active_cycle = int(progress.get("active_cycle", progress.get("completed_episodes", 0)))
+            move_number = int(progress.get("episode_steps", 0))
+            current_seconds = progress.get("current_episode_elapsed_seconds")
+            current_label = f"cycle {active_cycle}, move {move_number}"
+            eta_seconds = progress.get("estimated_remaining_seconds")
+            eta_label = f"eta {eta_seconds / 60.0:.1f}m" if isinstance(eta_seconds, (int, float)) else "eta n/a"
+            if isinstance(current_seconds, (int, float)):
+                hint = f"{current_label} | age {current_seconds:.0f}s | {eta_label} | status {progress.get('status', 'running')}"
+            else:
+                hint = f"{current_label} | {eta_label} | status {progress.get('status', 'running')}"
+        hint_surface = self.small_font.render(hint, True, (101, 109, 120))
+        screen.blit(hint_surface, (rect.x + 14, rect.y + 66))
+
     def _draw_input(self, screen: Any, rect: pygame.Rect, label: str, value: str, active: bool) -> None:
         label_surface = self.small_font.render(label, True, (95, 103, 113))
         screen.blit(label_surface, (rect.x, rect.y - 18))
@@ -1193,6 +1308,9 @@ class LabControlApp:
         elif button.kind == "primary":
             fill = (57, 97, 151)
             text_color = (250, 251, 252)
+        elif button.kind == "danger":
+            fill = (155, 76, 66)
+            text_color = (251, 248, 242)
         elif button.kind == "accent":
             fill = (205, 122, 76)
             text_color = (251, 248, 242)

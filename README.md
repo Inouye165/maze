@@ -181,6 +181,12 @@ The default app training stage is `maze-only`:
 
 The later `full-monster` stage keeps the monster system intact and writes checkpoints under `checkpoints/full_monster/`.
 
+Run tests, including the repo's Pylint convention check for line length and final newlines:
+
+```powershell
+python -m pytest -q
+```
+
 Use recurrent PPO instead of PPO:
 
 ```powershell

@@ -91,6 +91,7 @@ class MazeEnv(gym.Env[np.ndarray, int]):
                 self._latest_seed,
                 self._active_rows,
                 self._active_cols,
+                vision_range=self.config.vision_range,
             )
         )
         self._active_rows = self.layout.rows
@@ -253,15 +254,6 @@ class MazeEnv(gym.Env[np.ndarray, int]):
         self.peak_no_progress_steps = max(self.peak_no_progress_steps, self.no_progress_steps)
 
         repeat_loop_detected = self.repeat_move_streak >= 5 and new_cells == 0 and frontier_cells == 0
-        if not terminated and repeat_loop_detected:
-            truncated = True
-            reason = "stall"
-        if not terminated and not truncated and self.no_progress_steps >= self._active_stall_threshold:
-            truncated = True
-            reason = "stall"
-        if not terminated and not truncated and self.step_count >= self._active_max_episode_steps:
-            truncated = True
-            reason = "timeout"
 
         exit_progress_delta = float(previous_exit_distance - self._distance(self.player, self.layout.exit_position))
         monster_distance_delta = float(self._distance(self.player, self.monster) - previous_monster_distance)
@@ -296,6 +288,7 @@ class MazeEnv(gym.Env[np.ndarray, int]):
             "coverage": self.coverage,
             "revisits": self.revisits,
             "oscillations": self.oscillations,
+            "no_progress_steps": self.no_progress_steps,
             "dead_end_entries": self.dead_end_entries,
             "blocked_moves": self.blocked_moves,
             "illegal_moves": self.blocked_moves,
@@ -391,6 +384,7 @@ class MazeEnv(gym.Env[np.ndarray, int]):
             "monster": self.monster,
             "exit": self.layout.exit_position,
             "player_position": self.player.as_tuple(),
+            "player_visible": True,
             "monster_position": self.monster.as_tuple(),
             "exit_position": self.layout.exit_position.as_tuple(),
             "monster_visible": self.monster in self.visible_open_cells,
