@@ -75,3 +75,31 @@ def predict_action(
         return int(action), recurrent_state
     action, recurrent_state = model.predict(observation, deterministic=deterministic)
     return int(action), recurrent_state
+
+
+def action_probabilities(model: Any, observation: np.ndarray, action_masks: np.ndarray | None = None) -> np.ndarray | None:
+    """Return action probabilities when the model exposes a policy distribution."""
+
+    policy = getattr(model, "policy", None)
+    if policy is None or not hasattr(policy, "obs_to_tensor") or not hasattr(policy, "get_distribution"):
+        return None
+    try:
+        obs_tensor, _ = policy.obs_to_tensor(observation)
+        try:
+            distribution = policy.get_distribution(obs_tensor, action_masks=action_masks)
+        except TypeError:
+            distribution = policy.get_distribution(obs_tensor)
+        base_distribution = getattr(distribution, "distribution", distribution)
+        probabilities = getattr(base_distribution, "probs", None)
+        if probabilities is None:
+            return None
+        values = np.asarray(probabilities.detach().cpu().numpy()).reshape(-1)
+        if action_masks is not None and values.shape == action_masks.shape:
+            values = values.copy()
+            values[~action_masks] = 0.0
+            total = float(values.sum())
+            if total > 0.0:
+                values /= total
+        return values
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None

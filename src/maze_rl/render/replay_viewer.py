@@ -9,6 +9,14 @@ from typing import Any
 
 import pygame
 
+from maze_rl.render.view_state import (
+    viewer_cell_color,
+    viewer_exit_position,
+    viewer_grid,
+    viewer_monster_position,
+    viewer_player_position,
+    viewer_visible_cells,
+)
 from maze_rl.training.showcase import ShowcaseResult, run_checkpoint_showcase_episode
 
 QUIT = getattr(pygame, "QUIT", 256)
@@ -166,6 +174,7 @@ class ReplayViewer:
             "monster": None,
             "exit": None,
             "player_position": None,
+            "player_visible": True,
             "monster_position": None,
             "player_monster_distance": None,
             "seed": seed,
@@ -193,7 +202,8 @@ class ReplayViewer:
         outcome: str | None = None,
     ) -> None:
         screen.fill((18, 20, 28))
-        grid = state.get("grid", ())
+        grid = viewer_grid(state)
+        visible_cells = viewer_visible_cells(state)
         if grid:
             for row_index, row in enumerate(grid):
                 for col_index, cell in enumerate(row):
@@ -203,36 +213,42 @@ class ReplayViewer:
                         self.cell_size - 1,
                         self.cell_size - 1,
                     )
-                    if cell == "#":
-                        color = (36, 40, 52)
-                    elif cell == "?":
-                        color = (126, 132, 143)
-                    else:
-                        color = (235, 236, 240)
+                    color = viewer_cell_color(cell, (row_index, col_index) in visible_cells)
                     pygame.draw.rect(screen, color, rect)
 
-            entities = [(state["exit"], (70, 180, 90)), (state["player"], (60, 110, 220))]
-            if state.get("monster_visible", True):
-                entities.insert(1, (state["monster"], (205, 60, 60)))
+            entities: list[tuple[tuple[int, int] | None, tuple[int, int, int]]] = [
+                (viewer_exit_position(state), (70, 180, 90)),
+            ]
+            if state.get("player_visible", True):
+                entities.append((viewer_player_position(state), (60, 110, 220)))
+            entities.insert(1, (viewer_monster_position(state), (205, 60, 60)))
             for position, color in entities:
+                if position is None:
+                    continue
                 rect = pygame.Rect(
-                    self.margin + position.col * self.cell_size + 4,
-                    self.margin + position.row * self.cell_size + 4,
+                    self.margin + position[1] * self.cell_size + 4,
+                    self.margin + position[0] * self.cell_size + 4,
                     self.cell_size - 8,
                     self.cell_size - 8,
                 )
                 pygame.draw.rect(screen, color, rect, border_radius=6)
 
         info_top = self.margin + len(grid) * self.cell_size + 12
+        monster_text = viewer_monster_position(state)
         lines = [
             f"checkpoint: {state.get('checkpoint_label', Path(checkpoint_path).name)}",
             f"seed: {state['seed']} | steps: {state['steps']} | coverage: {state['coverage']:.2f}",
             (
-                f"player: {state.get('player_position')} | "
-                f"monster: {state.get('monster_position') if state.get('monster_visible', True) else 'hidden'} | "
-                f"distance: {state.get('player_monster_distance')}"
+                f"player: {viewer_player_position(state)} | "
+                f"vision cells: {len(visible_cells)} | "
+                f"monster: {monster_text} | "
+                f"npc sees monster: {state.get('monster_visible', True)}"
             ),
-            f"revisits: {state['revisits']} | oscillations: {state['oscillations']} | dead ends: {state['dead_end_entries']}",
+            (
+                f"revisits: {state['revisits']} | "
+                f"oscillations: {state['oscillations']} | "
+                f"dead ends: {state['dead_end_entries']}"
+            ),
             (
                 f"blocked: {state['blocked_moves']} | reward: {state['reward']:.2f} | "
                 f"frontier rate: {state.get('frontier_rate', 0.0):.2f}"

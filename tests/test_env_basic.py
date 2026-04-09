@@ -22,7 +22,7 @@ def test_env_reset_and_step_contract() -> None:
 
 
 def test_repeat_loop_indicator_penalizes_ping_pong_without_progress() -> None:
-    """Back-and-forth corner loops should raise a repeat indicator and truncate as a stall."""
+    """Back-and-forth corner loops should raise a repeat indicator but not end the game."""
 
     layout = MazeLayout(
         grid=(
@@ -59,7 +59,7 @@ def test_repeat_loop_indicator_penalizes_ping_pong_without_progress() -> None:
     assert last_info["peak_repeat_move_streak"] >= 5
     assert last_info["repeat_loop_detected"] is True
     assert last_info["state_snapshot"]["repeat_loop_warning"] is True
-    assert last_info["outcome"] == "stall"
+    assert last_info["outcome"] == "running"
 
 
 def test_visibility_memory_reveals_only_seen_cells_and_blocks_through_walls() -> None:
@@ -113,4 +113,5 @@ def test_visibility_hides_monster_when_wall_blocks_sightline() -> None:
     assert snapshot["grid"][1][4] == "#"
     assert snapshot["grid"][1][5] == "?"
     assert snapshot["grid"][1][6] == "?"
+    assert snapshot["player_visible"] is True
     assert snapshot["monster_visible"] is False

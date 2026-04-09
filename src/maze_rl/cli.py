@@ -11,7 +11,7 @@ from maze_rl.render.replay_viewer import ReplayViewer
 from maze_rl.training.checkpointing import resolve_checkpoint_path
 from maze_rl.training.evaluate import evaluate_checkpoint
 from maze_rl.training.showcase import format_showcase_table, run_showcase_headless, save_showcase_summary
-from maze_rl.training.train import train_from_scratch
+from maze_rl.training.train import format_training_progress, train_from_scratch
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -90,7 +90,21 @@ def main() -> None:
             seed=args.seed,
             recurring_checkpoint_interval=args.checkpoint_interval,
         )
-        artifacts = train_from_scratch(training_config=training_config, maze_config=maze_config)
+        last_progress_line: str | None = None
+
+        def _report_progress(progress: dict[str, object]) -> None:
+            nonlocal last_progress_line
+            line = format_training_progress(progress)
+            if line == last_progress_line:
+                return
+            last_progress_line = line
+            print(line)
+
+        artifacts = train_from_scratch(
+            training_config=training_config,
+            maze_config=maze_config,
+            progress_callback=_report_progress,
+        )
         print(f"training complete | episodes={artifacts.final_episode_count} | timesteps={artifacts.total_timesteps}")
         print(f"checkpoints: {artifacts.checkpoint_dir}")
         return
