@@ -112,6 +112,8 @@ class ImmutableCheckpointCallback(BaseCallback):
             "target_episodes": target,
             "active_cycle": active_cycle,
             "progress_ratio": completed / target,
+            "maze_seed": int(info.get("maze_seed", 0)) if info is not None else None,
+            "state_snapshot": snapshot if info is not None else None,
             "timesteps": self.num_timesteps,
             "episode_steps": int(snapshot.get("steps", 0)),
             "coverage": float(info.get("coverage", 0.0)) if info is not None else 0.0,
@@ -120,9 +122,12 @@ class ImmutableCheckpointCallback(BaseCallback):
             "peak_no_progress_steps": int(info.get("peak_no_progress_steps", 0)) if info is not None else 0,
             "repeat_move_streak": int(info.get("repeat_move_streak", 0)) if info is not None else 0,
             "repeat_loop_detected": bool(info.get("repeat_loop_detected", False)) if info is not None else False,
+            "avoidable_capture": bool(info.get("avoidable_capture", False)) if info is not None else False,
+            "avoidable_capture_reason": info.get("avoidable_capture_reason") if info is not None else None,
             "recent_win_rate": snapshot_summary["recent_win_rate"],
             "recent_stall_rate": snapshot_summary["recent_stall_rate"],
             "recent_timeout_rate": snapshot_summary["recent_timeout_rate"],
+            "recent_avoidable_capture_rate": snapshot_summary["recent_avoidable_capture_rate"],
             "recent_average_coverage": snapshot_summary["recent_average_coverage"],
             "elapsed_seconds": elapsed_seconds,
             "current_episode_elapsed_seconds": now - self._current_episode_started_at,
@@ -226,7 +231,7 @@ def continue_training_from_latest(
             TrainingConfig(
                 episodes=additional_episodes,
                 checkpoint_dir=Path(checkpoint_dir),
-                algorithm="maskable_ppo" if training_mode == "maze-only" else "ppo",
+                algorithm="maskable_ppo",
                 n_steps=64 if training_mode == "maze-only" else 128,
                 learning_rate=3e-4 if training_mode == "maze-only" else 2.5e-4,
                 ent_coef=0.05 if training_mode == "maze-only" else 0.02,
@@ -242,22 +247,40 @@ def continue_training_from_latest(
         maze_config_from_dict(metadata["maze_config"]),
         training_mode,
     )
-    training_config = training_config_from_dict(metadata["training_config"])
+    previous_training_config = training_config_from_dict(metadata["training_config"])
+    if previous_training_config.algorithm != "maskable_ppo":
+        if latest_episode <= 0:
+            return train_from_scratch(
+                TrainingConfig(
+                    episodes=additional_episodes,
+                    checkpoint_dir=Path(checkpoint_dir),
+                    algorithm="maskable_ppo",
+                    seed=previous_training_config.seed,
+                    n_steps=64 if training_mode == "maze-only" else 128,
+                    learning_rate=3e-4 if training_mode == "maze-only" else 2.5e-4,
+                    ent_coef=0.05 if training_mode == "maze-only" else 0.02,
+                ),
+                maze_config=maze_config,
+                stop_event=stop_event,
+                progress_callback=progress_callback,
+            )
+        raise ValueError(
+            "Existing checkpoint uses plain PPO, so innate safety masks cannot be enforced during training. "
+            "Reset this training branch and retrain with maskable_ppo to preserve flee behavior."
+        )
+    resumed_seed = previous_training_config.seed + latest_episode
     training_config = TrainingConfig(
         **{
-            **training_config.__dict__,
+            **previous_training_config.__dict__,
             "checkpoint_dir": Path(checkpoint_dir),
             "episodes": latest_episode + additional_episodes,
-            "algorithm": (
-                "maskable_ppo"
-                if training_mode == "maze-only"
-                else training_config.algorithm
-            ),
-            "n_steps": 64 if training_mode == "maze-only" else training_config.n_steps,
+            "seed": resumed_seed,
+            "algorithm": "maskable_ppo",
+            "n_steps": 64 if training_mode == "maze-only" else previous_training_config.n_steps,
             "learning_rate": (
-                3e-4 if training_mode == "maze-only" else training_config.learning_rate
+                3e-4 if training_mode == "maze-only" else previous_training_config.learning_rate
             ),
-            "ent_coef": 0.05 if training_mode == "maze-only" else training_config.ent_coef,
+            "ent_coef": 0.05 if training_mode == "maze-only" else previous_training_config.ent_coef,
         }
     )
     training_config.log_dir.mkdir(parents=True, exist_ok=True)
@@ -265,6 +288,7 @@ def continue_training_from_latest(
     manager = CheckpointManager(training_config=training_config, maze_config=maze_config)
     env = build_training_env(maze_config)
     model = load_model_from_checkpoint(checkpoint_path, env)
+    model.set_random_seed(training_config.seed)
     callback = ImmutableCheckpointCallback(
         manager=manager,
         training_config=training_config,
@@ -298,7 +322,10 @@ def maze_config_for_training_mode(maze_config: MazeConfig, training_mode: str) -
         revisit_penalty=-0.6,
         revisit_depth_penalty=-0.2,
         oscillation_penalty=-1.5,
-        dead_end_penalty=-0.3,
+        dead_end_penalty=-0.45,
+        # Keep this below exploration and exit progress so PPO still has to trade off,
+        # but make avoidable visible dead ends costly enough to learn before contact.
+        avoidable_visible_dead_end_penalty=-0.8,
         blocked_move_penalty=-2.0,
         exit_progress_reward=1.6,
         safety_gain_reward=1.8,
@@ -339,12 +366,19 @@ def format_training_progress(progress: dict[str, Any]) -> str:
     recent_win_rate = float(progress.get("recent_win_rate", 0.0))
     recent_stall_rate = float(progress.get("recent_stall_rate", 0.0))
     recent_timeout_rate = float(progress.get("recent_timeout_rate", 0.0))
+    recent_avoidable_capture_rate = float(progress.get("recent_avoidable_capture_rate", 0.0))
     status = str(progress.get("status", "running"))
+    maze_seed = progress.get("maze_seed")
     extra = f" | cycle {active_cycle} | move {episode_steps}"
+    if maze_seed is not None:
+        extra += f" | seed={int(maze_seed)}"
     if status == "no-progress" or no_progress_steps > 0:
         extra += " | no-progress"
     if progress.get("repeat_loop_detected"):
         extra += " | repeat-loop"
+    if progress.get("avoidable_capture"):
+        reason = progress.get("avoidable_capture_reason") or "avoidable-capture"
+        extra += f" | {reason}"
     return (
         f"training {completed}/{target} ({progress_pct:.1f}%)"
         f" | steps={episode_steps}"
@@ -355,5 +389,6 @@ def format_training_progress(progress: dict[str, Any]) -> str:
         f" | recent_win_rate={recent_win_rate:.2f}"
         f" | recent_stall_rate={recent_stall_rate:.2f}"
         f" | recent_timeout_rate={recent_timeout_rate:.2f}"
+        f" | recent_avoidable_capture_rate={recent_avoidable_capture_rate:.2f}"
         f"{extra}"
     )

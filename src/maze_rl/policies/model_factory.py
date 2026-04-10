@@ -12,6 +12,10 @@ from stable_baselines3 import PPO
 from maze_rl.config import TrainingConfig
 
 
+class CheckpointCompatibilityError(ValueError):
+    """Raised when a saved checkpoint no longer matches the current environment."""
+
+
 def create_model(training_config: TrainingConfig, env: Any) -> Any:
     """Create the requested SB3 model."""
 
@@ -43,12 +47,23 @@ def load_model_from_checkpoint(checkpoint_path: str | Path, env: Any) -> Any:
     metadata_path = Path(checkpoint_path).with_suffix(".json")
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     algorithm = metadata["algorithm"]
-    if algorithm == "maskable_ppo":
-        return MaskablePPO.load(str(checkpoint_path), env=env, device="cpu")
-    if algorithm == "ppo":
-        return PPO.load(str(checkpoint_path), env=env, device="cpu")
-    if algorithm == "recurrent_ppo":
-        return RecurrentPPO.load(str(checkpoint_path), env=env, device="cpu")
+    try:
+        if algorithm == "maskable_ppo":
+            return MaskablePPO.load(str(checkpoint_path), env=env, device="cpu")
+        if algorithm == "ppo":
+            return PPO.load(str(checkpoint_path), env=env, device="cpu")
+        if algorithm == "recurrent_ppo":
+            return RecurrentPPO.load(str(checkpoint_path), env=env, device="cpu")
+    except ValueError as error:
+        message = str(error)
+        if "spaces do not match" in message:
+            raise CheckpointCompatibilityError(
+                "Checkpoint is incompatible with the current environment shape. "
+                "This usually means the observation or action space changed "
+                "and the model must be retrained. "
+                f"checkpoint={checkpoint_path} | details={message}"
+            ) from error
+        raise
     raise ValueError(f"Unsupported algorithm in metadata: {algorithm}")
 
 

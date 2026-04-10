@@ -11,10 +11,14 @@ import pygame
 
 from maze_rl.render.view_state import (
     viewer_cell_color,
+    viewer_dead_end_cells,
+    viewer_explored_cells,
     viewer_exit_position,
     viewer_grid,
     viewer_monster_position,
+    viewer_policy_badge,
     viewer_player_position,
+    viewer_traveled_cells,
     viewer_visible_cells,
 )
 from maze_rl.training.showcase import ShowcaseResult, run_checkpoint_showcase_episode
@@ -40,6 +44,7 @@ class ReplayViewer:
         max_no_progress_streak: int = 25,
         wall_time_timeout_s: float = 30.0,
         debug_trace: bool = False,
+        allow_policy_override: bool = False,
     ) -> str:
         """Render a frozen run and return the final outcome."""
 
@@ -53,6 +58,7 @@ class ReplayViewer:
             wall_time_timeout_s=wall_time_timeout_s,
             on_step=lambda state: self._render_frame(state, checkpoint_path, fps),
             debug_trace=debug_trace,
+            allow_policy_override=allow_policy_override,
         )
         self._draw(self._screen, self._coerce_state(result, seed), self._font, checkpoint_path, outcome=result.outcome)
         pygame.display.flip()
@@ -71,6 +77,7 @@ class ReplayViewer:
         max_no_progress_streak: int = 25,
         wall_time_timeout_s: float = 30.0,
         debug_trace: bool = False,
+        allow_policy_override: bool = False,
     ) -> list[ShowcaseResult]:
         """Render a sequential autoplay showcase in one window."""
 
@@ -111,6 +118,7 @@ class ReplayViewer:
                 wall_time_timeout_s=wall_time_timeout_s,
                 on_step=lambda state, current_path=path: self._render_frame(state, current_path, fps),
                 debug_trace=debug_trace,
+                allow_policy_override=allow_policy_override,
             )
             results.append(result)
             self._draw(self._screen, self._coerce_state(result, seed), self._font, path, outcome=result.outcome)
@@ -204,6 +212,9 @@ class ReplayViewer:
         screen.fill((18, 20, 28))
         grid = viewer_grid(state)
         visible_cells = viewer_visible_cells(state)
+        explored_cells = viewer_explored_cells(state)
+        traveled_cells = viewer_traveled_cells(state)
+        dead_end_cells = viewer_dead_end_cells(state)
         if grid:
             for row_index, row in enumerate(grid):
                 for col_index, cell in enumerate(row):
@@ -213,7 +224,14 @@ class ReplayViewer:
                         self.cell_size - 1,
                         self.cell_size - 1,
                     )
-                    color = viewer_cell_color(cell, (row_index, col_index) in visible_cells)
+                    position = (row_index, col_index)
+                    color = viewer_cell_color(
+                        cell,
+                        position in visible_cells,
+                        is_explored=position in explored_cells,
+                        is_traveled=position in traveled_cells,
+                        is_dead_end=position in dead_end_cells,
+                    )
                     pygame.draw.rect(screen, color, rect)
 
             entities: list[tuple[tuple[int, int] | None, tuple[int, int, int]]] = [
@@ -235,6 +253,12 @@ class ReplayViewer:
 
         info_top = self.margin + len(grid) * self.cell_size + 12
         monster_text = viewer_monster_position(state)
+        badge_label, badge_color, badge_text_color = viewer_policy_badge(state)
+        badge = pygame.Rect(self.margin, info_top, min(380, max(180, len(badge_label) * 10)), 28)
+        pygame.draw.rect(screen, badge_color, badge, border_radius=10)
+        badge_text = font.render(badge_label, True, badge_text_color)
+        screen.blit(badge_text, (badge.x + 10, badge.y + 4))
+        info_top += 36
         lines = [
             f"checkpoint: {state.get('checkpoint_label', Path(checkpoint_path).name)}",
             f"seed: {state['seed']} | steps: {state['steps']} | coverage: {state['coverage']:.2f}",
@@ -257,6 +281,12 @@ class ReplayViewer:
                 f"start monster distance: {state.get('start_monster_distance', 'n/a')} | "
                 f"peak no-progress: {state.get('peak_no_progress_streak', 0)} | "
                 f"capture: {state.get('capture_rule')}"
+            ),
+            (
+                f"policy: {state.get('policy_kind', 'trained')} | "
+                f"override enabled: {state.get('policy_override_enabled', False)} | "
+                f"override count: {state.get('policy_override_count', 0)} | "
+                f"reason: {state.get('policy_override_reason', 'n/a')}"
             ),
         ]
         if outcome:
