@@ -6,6 +6,7 @@ import argparse
 from pathlib import Path
 
 from maze_rl.config import MazeConfig, TrainingConfig
+from maze_rl.policies.model_factory import CheckpointCompatibilityError
 from maze_rl.render.control_app import run_app
 from maze_rl.render.replay_viewer import ReplayViewer
 from maze_rl.training.checkpointing import resolve_checkpoint_path
@@ -43,6 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
     watch_parser.add_argument("--seed", type=int, required=True)
     watch_parser.add_argument("--fps", type=int, default=10)
     watch_parser.add_argument("--debug-trace", action="store_true")
+    watch_parser.add_argument("--allow-policy-override", action="store_true")
 
     compare_parser = subparsers.add_parser("compare", help="Compare multiple checkpoints on one seed")
     compare_parser.add_argument("--checkpoints", nargs="+", type=int, required=True)
@@ -60,6 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
     showcase_parser.add_argument("--wall-timeout-s", type=float, default=30.0)
     showcase_parser.add_argument("--save-summary-json", default=None)
     showcase_parser.add_argument("--debug-trace", action="store_true")
+    showcase_parser.add_argument("--allow-policy-override", action="store_true")
 
     app_parser = subparsers.add_parser("app", help="Open the local control panel app")
     app_parser.add_argument("--checkpoint-dir", default="checkpoints")
@@ -110,7 +113,16 @@ def main() -> None:
         return
 
     if args.command == "eval":
-        summary = evaluate_checkpoint(args.checkpoint, seed=args.seed, episodes=args.episodes, seeds=args.seeds, debug_trace=args.debug_trace)
+        try:
+            summary = evaluate_checkpoint(
+                args.checkpoint,
+                seed=args.seed,
+                episodes=args.episodes,
+                seeds=args.seeds,
+                debug_trace=args.debug_trace,
+            )
+        except CheckpointCompatibilityError as error:
+            parser.exit(2, f"checkpoint compatibility error: {error}\n")
         print(f"checkpoint: {summary.checkpoint}")
         if summary.seeds:
             print(f"seeds: {summary.seeds} | episodes: {summary.episodes}")
@@ -133,7 +145,16 @@ def main() -> None:
         return
 
     if args.command == "watch":
-        outcome = ReplayViewer().watch(args.checkpoint, seed=args.seed, fps=args.fps, debug_trace=args.debug_trace)
+        try:
+            outcome = ReplayViewer().watch(
+                args.checkpoint,
+                seed=args.seed,
+                fps=args.fps,
+                debug_trace=args.debug_trace,
+                allow_policy_override=args.allow_policy_override,
+            )
+        except CheckpointCompatibilityError as error:
+            parser.exit(2, f"checkpoint compatibility error: {error}\n")
         print(f"final outcome: {outcome}")
         return
 
@@ -145,7 +166,7 @@ def main() -> None:
                 continue
             try:
                 summary = evaluate_checkpoint(checkpoint_path, seed=args.seed, episodes=1)
-            except FileNotFoundError as error:
+            except (CheckpointCompatibilityError, FileNotFoundError) as error:
                 print(f"ckpt {checkpoint_episode:04d} | unavailable | {error} | skipping")
                 continue
             print(
@@ -163,24 +184,32 @@ def main() -> None:
             for checkpoint_episode in args.checkpoints
         ]
         if args.headless:
-            results = run_showcase_headless(
-                checkpoint_dir=args.checkpoint_dir,
-                checkpoints=args.checkpoints,
-                seed=args.seed,
-                max_no_progress_streak=args.max_no_progress_streak,
-                wall_time_timeout_s=args.wall_timeout_s,
-                debug_trace=args.debug_trace,
-            )
+            try:
+                results = run_showcase_headless(
+                    checkpoint_dir=args.checkpoint_dir,
+                    checkpoints=args.checkpoints,
+                    seed=args.seed,
+                    max_no_progress_streak=args.max_no_progress_streak,
+                    wall_time_timeout_s=args.wall_timeout_s,
+                    debug_trace=args.debug_trace,
+                    allow_policy_override=args.allow_policy_override,
+                )
+            except CheckpointCompatibilityError as error:
+                parser.exit(2, f"checkpoint compatibility error: {error}\n")
         else:
-            results = ReplayViewer().showcase(
-                checkpoint_entries=checkpoint_entries,
-                seed=args.seed,
-                fps=args.fps,
-                pause_ms=args.pause_ms,
-                max_no_progress_streak=args.max_no_progress_streak,
-                wall_time_timeout_s=args.wall_timeout_s,
-                debug_trace=args.debug_trace,
-            )
+            try:
+                results = ReplayViewer().showcase(
+                    checkpoint_entries=checkpoint_entries,
+                    seed=args.seed,
+                    fps=args.fps,
+                    pause_ms=args.pause_ms,
+                    max_no_progress_streak=args.max_no_progress_streak,
+                    wall_time_timeout_s=args.wall_timeout_s,
+                    debug_trace=args.debug_trace,
+                    allow_policy_override=args.allow_policy_override,
+                )
+            except CheckpointCompatibilityError as error:
+                parser.exit(2, f"checkpoint compatibility error: {error}\n")
             missing = {item.checkpoint for item in results if item.status == "missing"}
             for checkpoint_episode in args.checkpoints:
                 label = f"ckpt {checkpoint_episode:04d}"

@@ -3,7 +3,6 @@
 # once the corresponding source line is fixed.
 src/maze_rl/__init__.py:5:C0304:Final newline missing
 src/maze_rl/cli.py:108:C0301:Line too long (118/100)
-src/maze_rl/cli.py:113:C0301:Line too long (142/100)
 src/maze_rl/cli.py:129:C0301:Line too long (123/100)
 src/maze_rl/cli.py:136:C0301:Line too long (115/100)
 src/maze_rl/cli.py:13:C0301:Line too long (105/100)
@@ -13,12 +12,10 @@ src/maze_rl/cli.py:156:C0301:Line too long (178/100)
 src/maze_rl/cli.py:189:C0301:Line too long (105/100)
 src/maze_rl/cli.py:25:C0301:Line too long (109/100)
 src/maze_rl/cli.py:47:C0301:Line too long (102/100)
-src/maze_rl/cli.py:52:C0301:Line too long (115/100)
 src/maze_rl/envs/__init__.py:5:C0304:Final newline missing
 src/maze_rl/envs/debug_layouts.py:23:C0304:Final newline missing
 src/maze_rl/envs/rewards.py:49:C0301:Line too long (109/100)
 src/maze_rl/envs/rewards.py:50:C0301:Line too long (106/100)
-src/maze_rl/envs/rewards.py:73:C0301:Line too long (111/100)
 src/maze_rl/envs/rewards.py:85:C0304:Final newline missing
 src/maze_rl/policies/__init__.py:5:C0304:Final newline missing
 src/maze_rl/policies/model_factory.py:105:C0304:Final newline missing
@@ -61,6 +58,7 @@ src/maze_rl/training/showcase.py:543:C0301:Line too long (109/100)
 src/maze_rl/training/showcase.py:544:C0301:Line too long (146/100)
 src/maze_rl/training/showcase.py:560:C0301:Line too long (112/100)
 src/maze_rl/training/showcase.py:580:C0301:Line too long (106/100)
+src/maze_rl/training/showcase.py:634:C0301:Line too long (106/100)
 src/maze_rl/training/showcase.py:663:C0301:Line too long (111/100)
 src/maze_rl/training/showcase.py:667:C0301:Line too long (119/100)
 src/maze_rl/training/showcase.py:668:C0301:Line too long (145/100)
@@ -86,6 +84,4 @@ tests/test_checkpoint_flow.py:21:C0301:Line too long (111/100)
 tests/test_debug_trace_and_capture.py:128:C0304:Final newline missing
 tests/test_debug_trace_and_capture.py:33:C0301:Line too long (127/100)
 tests/test_debug_trace_and_capture.py:39:C0301:Line too long (115/100)
-tests/test_env_basic.py:108:C0301:Line too long (117/100)
-tests/test_env_basic.py:81:C0301:Line too long (117/100)
 tests/test_eval_multiseed.py:47:C0304:Final newline missing

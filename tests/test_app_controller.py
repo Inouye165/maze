@@ -6,7 +6,7 @@ from pathlib import Path
 
 from maze_rl.config import MazeConfig, TrainingConfig
 from maze_rl.envs.maze_env import MazeEnv
-from maze_rl.policies.model_factory import create_model
+from maze_rl.policies.model_factory import CheckpointCompatibilityError, create_model
 from maze_rl.render.control_app import LabAppController, LabControlApp
 from maze_rl.training.checkpointing import CheckpointManager
 from maze_rl.training.train import maze_config_for_training_mode
@@ -87,6 +87,7 @@ def test_app_controller_supports_baseline_current_ai_and_replay(tmp_path: Path) 
     controller.start_current_ai_run()
     assert controller.session is not None
     assert controller.current_mode == "current-learned-ai"
+    assert getattr(controller.session, "allow_policy_override", False) is True
 
 
 def test_basic_tab_uses_play_label_instead_of_marks_play(tmp_path: Path) -> None:
@@ -124,6 +125,7 @@ def test_play_runs_trained_mode_when_checkpoint_exists(tmp_path: Path) -> None:
     assert controller.session is not None
     assert controller.current_mode == "current-learned-ai"
     assert controller.play_mode_status() == "Mode: Trained (ckpt 0000)"
+    assert getattr(controller.session, "allow_policy_override", False) is True
 
 
 def test_app_controller_uses_mode_specific_checkpoint_directories(tmp_path: Path) -> None:
@@ -192,6 +194,28 @@ def test_app_controller_compare_milestones_skips_missing_and_runs_existing(tmp_p
     )
 
 
+def test_app_controller_handles_incompatible_checkpoint_without_crashing(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """The app should surface an incompatible checkpoint instead of crashing."""
+
+    _create_checkpoints(tmp_path, episodes=(0,))
+
+    def fail_playback(**_kwargs):
+        raise CheckpointCompatibilityError("Observation spaces do not match")
+
+    monkeypatch.setattr("maze_rl.render.control_app.PlaybackSession", fail_playback)
+
+    controller = LabAppController(checkpoint_dir=tmp_path)
+    controller.start_current_ai_run()
+
+    assert controller.session is None
+    assert controller.last_state is None
+    assert controller.last_result is None
+    assert "incompatible" in controller.training_message
+
+
 def test_app_controller_training_controls_use_app_selected_mode(tmp_path: Path, monkeypatch) -> None:
     """Training controls should use the app-selected training mode and support stop requests."""
 
@@ -233,6 +257,49 @@ def test_app_controller_training_controls_use_app_selected_mode(tmp_path: Path, 
 
     controller.toggle_training_mode()
     assert controller.training_mode == "full-monster"
+
+
+def test_training_progress_summary_and_render_state_show_live_training_seed_and_map() -> None:
+    """The app should surface the active training seed and render the live training maze."""
+
+    controller = LabAppController(checkpoint_dir=Path("unused"))
+    controller.training_status = "running"
+    controller.training_progress = {
+        "maze_seed": 424242,
+        "active_cycle": 3,
+        "completed_episodes": 2,
+        "target_episodes": 5,
+        "episode_steps": 12,
+        "state_snapshot": {
+            "grid": (
+                "#####",
+                "#...#",
+                "#####",
+            ),
+            "full_grid": (
+                "#####",
+                "#...#",
+                "#####",
+            ),
+            "player_position": (1, 1),
+            "monster_position": (1, 3),
+            "exit_position": (1, 2),
+            "seed": 424242,
+        },
+    }
+
+    class _AliveThread:
+        def is_alive(self) -> bool:
+            return True
+
+    controller.training_thread = _AliveThread()  # type: ignore[assignment]
+
+    assert "seed 424242" in controller.training_progress_summary()
+    assert controller.active_training_seed() == 424242
+    render_state = controller.render_state()
+    assert render_state is not None
+    assert render_state["seed"] == 424242
+    assert render_state["checkpoint_label"] == "training maze-only"
 
 
 def test_maze_learning_mode_simplifies_actions_and_slows_monster() -> None:

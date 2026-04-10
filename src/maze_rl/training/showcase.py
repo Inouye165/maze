@@ -15,11 +15,18 @@ import numpy as np
 from maze_rl.config import MazeConfig, maze_config_from_dict
 from maze_rl.envs.maze_env import MazeEnv
 from maze_rl.envs.entities import Position
-from maze_rl.policies.model_factory import action_probabilities, load_model_from_checkpoint, predict_action
+from maze_rl.policies.model_factory import (
+    CheckpointCompatibilityError,
+    action_probabilities,
+    load_model_from_checkpoint,
+    predict_action,
+)
 from maze_rl.training.checkpointing import load_checkpoint_metadata, resolve_checkpoint_path
 
 
 DIRECTION_DELTAS = [(-1, 0), (0, 1), (1, 0), (0, -1)]
+WAIT_ACTION = -1
+WAIT_DIRECTION = 4
 
 
 @dataclass(frozen=True)
@@ -46,6 +53,8 @@ class ShowcaseResult:
     final_state: dict[str, Any] | None = None
     checkpoint_path: str | None = None
     seed: int | None = None
+    policy_override_count: int = 0
+    last_override_reason: str | None = None
     notes: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -74,52 +83,98 @@ class HeuristicMoveChoice:
 
     action: int
     direction: int
+    speed: int
     target: Position
     visits: int
     nearest_unvisited_distance: int
     exit_distance: int
     monster_distance: int
     monster_distance_gain: int
+    direct_monster_escape: bool
     immediate_reverse: bool
     short_loop_risk: int
+    enters_dead_end: bool
+    known_dead_end: bool
+    wait_action: bool
 
 
 def describe_move_choice(env: MazeEnv, action: int) -> HeuristicMoveChoice | None:
     """Describe one legal move using the same features as the fallback ranking."""
 
-    if env.player is None:
+    if env.player is None or env.layout is None or env.monster is None:
         return None
-    direction, _speed = env.decode_action(action)
-    delta_row, delta_col = DIRECTION_DELTAS[direction]
-    target = env.player.shifted(delta_row, delta_col)
-    if _is_wall_position(env, target):
+    threat_position = _threat_reference_position(env)
+    if action == WAIT_ACTION:
+        current_monster_distance = (
+            _path_distance(env, env.player, threat_position)
+            if threat_position is not None
+            else 9999
+        )
+        return HeuristicMoveChoice(
+            action=action,
+            direction=WAIT_DIRECTION,
+            speed=0,
+            target=env.player,
+            visits=0,
+            nearest_unvisited_distance=_nearest_unvisited_distance(env, env.player),
+            exit_distance=_path_distance(env, env.player, env.layout.exit_position),
+            monster_distance=current_monster_distance,
+            monster_distance_gain=0,
+            direct_monster_escape=False,
+            immediate_reverse=False,
+            short_loop_risk=0,
+            enters_dead_end=env.player in env.known_dead_end_cells,
+            known_dead_end=env.player in env.known_dead_end_cells,
+            wait_action=True,
+        )
+    direction, speed = env.decode_action(action)
+    first_step_target, target, completed_full_speed = _project_action_target(env, action)
+    if first_step_target is None or target is None or not completed_full_speed:
         return None
     previous_position = _previous_position(env)
     exit_distance = _path_distance(env, target, env.layout.exit_position)
-    current_monster_distance = _path_distance(env, env.player, env.monster)
-    monster_distance = _path_distance(env, target, env.monster)
+    current_monster_distance = (
+        _path_distance(env, env.player, threat_position)
+        if threat_position is not None
+        else 9999
+    )
+    monster_distance = (
+        _path_distance(env, target, threat_position)
+        if threat_position is not None
+        else 9999
+    )
     return HeuristicMoveChoice(
         action=action,
         direction=direction,
+        speed=speed,
         target=target,
         visits=env.visited_counts.get(target, 0),
         nearest_unvisited_distance=_nearest_unvisited_distance(env, target),
         exit_distance=exit_distance,
         monster_distance=monster_distance,
         monster_distance_gain=monster_distance - current_monster_distance,
-        immediate_reverse=previous_position is not None and target == previous_position,
+        direct_monster_escape=_is_direct_monster_escape(env, target),
+        immediate_reverse=previous_position is not None and first_step_target == previous_position,
         short_loop_risk=_short_loop_risk(env, target),
+        enters_dead_end=_is_dead_end_target(env, target),
+        known_dead_end=target in env.known_dead_end_cells,
+        wait_action=False,
     )
 
 
 def rank_legal_moves(env: MazeEnv) -> list[HeuristicMoveChoice]:
     """Rank legal one-step moves to favor coverage and avoid local loops."""
 
+    action_count = int(getattr(env.action_space, "n", 0))
     choices = [
         choice
-        for direction in range(4)
-        if (choice := describe_move_choice(env, direction * env.config.max_player_speed)) is not None
+        for action in range(action_count)
+        if (choice := describe_move_choice(env, action)) is not None
     ]
+    if _should_offer_wait(env, choices):
+        wait_choice = describe_move_choice(env, WAIT_ACTION)
+        if wait_choice is not None:
+            choices.append(wait_choice)
     fear_mode = _fear_mode(env, choices)
     return sorted(
         choices,
@@ -134,6 +189,23 @@ def choose_heuristic_action(env: MazeEnv) -> int:
     return ranked[0].action if ranked else 0
 
 
+def _policy_decision_label(
+    policy_kind: str,
+    override_enabled: bool,
+    override_reason: str | None,
+) -> str:
+    """Return a short human-readable label for the current decision source."""
+
+    if policy_kind == "heuristic-override":
+        reason = override_reason.replace("-", " ") if override_reason else "safety override"
+        return f"safety override: {reason}"
+    if policy_kind == "innate":
+        return "innate heuristic"
+    if override_enabled:
+        return "trained policy with safety net"
+    return "trained policy"
+
+
 def _previous_position(env: MazeEnv) -> Position | None:
     history = list(env.path_history)
     if len(history) < 2:
@@ -144,17 +216,16 @@ def _previous_position(env: MazeEnv) -> Position | None:
 def _nearest_unvisited_distance(env: MazeEnv, start: Position) -> int:
     """Measure how quickly a move can reach unexplored space."""
 
-    if env.visited_counts.get(start, 0) == 0:
+    if start in env.seen_open_cells and env.visited_counts.get(start, 0) == 0:
         return 0
     queue: deque[tuple[Position, int]] = deque([(start, 0)])
     seen = {start}
     while queue:
         current, distance = queue.popleft()
-        for delta_row, delta_col in DIRECTION_DELTAS:
-            candidate = current.shifted(delta_row, delta_col)
-            if _is_wall_position(env, candidate) or candidate in seen:
+        for candidate in _known_neighbors(env, current):
+            if candidate in seen:
                 continue
-            if env.visited_counts.get(candidate, 0) == 0:
+            if candidate in env.seen_open_cells and env.visited_counts.get(candidate, 0) == 0:
                 return distance + 1
             seen.add(candidate)
             queue.append((candidate, distance + 1))
@@ -162,14 +233,36 @@ def _nearest_unvisited_distance(env: MazeEnv, start: Position) -> int:
 
 
 def _path_distance(env: MazeEnv, start: Position, goal: Position) -> int:
-    """Return the shortest legal path distance between two positions."""
+    """Return the shortest path distance through the known map only."""
 
-    path = env._shortest_path(start, goal)
-    if not path:
+    if start == goal:
+        return 0
+    if start not in env.seen_open_cells or goal not in env.seen_open_cells:
         return 9999
-    if len(path) == 1 and start != goal:
-        return 9999
-    return max(0, len(path) - 1)
+
+    queue: deque[tuple[Position, int]] = deque([(start, 0)])
+    seen = {start}
+    while queue:
+        current, distance = queue.popleft()
+        if current == goal:
+            return distance
+        for candidate in _known_neighbors(env, current):
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            queue.append((candidate, distance + 1))
+    return 9999
+
+
+def _known_neighbors(env: MazeEnv, position: Position) -> tuple[Position, ...]:
+    """Return traversable neighbors that exist in the agent's remembered map."""
+
+    neighbors: list[Position] = []
+    for delta_row, delta_col in DIRECTION_DELTAS:
+        candidate = position.shifted(delta_row, delta_col)
+        if candidate in env.seen_open_cells:
+            neighbors.append(candidate)
+    return tuple(neighbors)
 
 
 def _is_wall_position(env: MazeEnv, position: Position) -> bool:
@@ -187,6 +280,25 @@ def _is_wall_position(env: MazeEnv, position: Position) -> bool:
     )
 
 
+def _project_action_target(env: MazeEnv, action: int) -> tuple[Position | None, Position | None, bool]:
+    """Return first-step target, final target, and whether the full speed completes legally."""
+
+    if env.player is None:
+        return None, None, False
+    direction, speed = env.decode_action(action)
+    delta_row, delta_col = DIRECTION_DELTAS[direction]
+    current = env.player
+    first_step_target: Position | None = None
+    for step_index in range(speed):
+        candidate = current.shifted(delta_row, delta_col)
+        if _is_wall_position(env, candidate):
+            return first_step_target, current, False
+        current = candidate
+        if step_index == 0:
+            first_step_target = current
+    return first_step_target, current, True
+
+
 def _short_loop_risk(env: MazeEnv, candidate: Position) -> int:
     """Score how strongly a move resembles a short back-and-forth loop."""
 
@@ -201,21 +313,127 @@ def _short_loop_risk(env: MazeEnv, candidate: Position) -> int:
     return risk
 
 
+def _is_dead_end_target(env: MazeEnv, target: Position) -> bool:
+    """Return whether the target is a dead-end cell, excluding the maze exit."""
+
+    if env.layout is not None and target == env.layout.exit_position:
+        return False
+    exits = sum(
+        1 for dr, dc in DIRECTION_DELTAS if not _is_wall_position(env, target.shifted(dr, dc))
+    )
+    return exits <= 1
+
+
+def _is_direct_monster_escape(env: MazeEnv, candidate: Position) -> bool:
+    """Return whether a move heads directly away from the monster's strongest approach axis."""
+
+    threat_position = _threat_reference_position(env)
+    if env.player is None or threat_position is None:
+        return False
+    row_delta = threat_position.row - env.player.row
+    col_delta = threat_position.col - env.player.col
+    candidate_row_delta = candidate.row - env.player.row
+    candidate_col_delta = candidate.col - env.player.col
+
+    if abs(col_delta) >= abs(row_delta) and col_delta != 0:
+        return candidate_col_delta == (-1 if col_delta > 0 else 1)
+    if row_delta != 0:
+        return candidate_row_delta == (-1 if row_delta > 0 else 1)
+    return False
+
+
 def _fear_mode(env: MazeEnv, choices: list[HeuristicMoveChoice]) -> bool:
     """Return whether the heuristic should prioritize running from the monster."""
 
-    if env.player is None or env.monster is None or env.layout is None or not choices:
+    threat_position = _threat_reference_position(env)
+    if env.player is None or threat_position is None or env.layout is None or not choices:
         return False
+    current_monster_distance = _path_distance(env, env.player, threat_position)
     monster_visible = env.monster in env.visible_open_cells
-    current_monster_distance = _path_distance(env, env.player, env.monster)
-    if monster_visible and current_monster_distance <= max(4, env.config.vision_range):
+    if current_monster_distance <= 2:
         return True
+    has_escape_gain = any(choice.monster_distance_gain > 0 for choice in choices)
+    if monster_visible and current_monster_distance <= max(5, env.player_vision_range + 1):
+        return True
+    if _monster_recently_seen(env) and current_monster_distance <= 4 and has_escape_gain:
+        return True
+    if monster_visible and has_escape_gain:
+        current_exit_distance = _path_distance(env, env.player, env.layout.exit_position)
+        has_safe_exit_progress = any(
+            choice.exit_distance < current_exit_distance and choice.monster_distance_gain >= 0
+            for choice in choices
+        )
+        return not has_safe_exit_progress
+    return False
+
+
+def _should_offer_wait(env: MazeEnv, choices: list[HeuristicMoveChoice]) -> bool:
+    """Return whether a tactical wait is better than committing to a bad branch."""
+
+    threat_position = _threat_reference_position(env)
+    if env.player is None or threat_position is None or env.layout is None or not choices:
+        return False
+    current_monster_distance = _path_distance(env, env.player, threat_position)
+    if current_monster_distance <= 6:
+        return False
+    if env.player in env.known_dead_end_cells:
+        return False
+    if env.monster in env.visible_open_cells:
+        return False
+    if not _monster_recently_seen(env):
+        return False
     current_exit_distance = _path_distance(env, env.player, env.layout.exit_position)
-    has_safe_exit_progress = any(
-        choice.exit_distance < current_exit_distance and choice.monster_distance_gain >= 0
+    safe_unvisited = any(
+        not choice.known_dead_end
+        and not choice.enters_dead_end
+        and not choice.wait_action
+        and choice.visits == 0
+        and choice.monster_distance_gain >= 0
         for choice in choices
     )
-    return monster_visible and not has_safe_exit_progress
+    safe_exit_progress = any(
+        not choice.known_dead_end
+        and not choice.enters_dead_end
+        and not choice.wait_action
+        and choice.exit_distance < current_exit_distance
+        and choice.monster_distance_gain >= 0
+        for choice in choices
+    )
+    risky_commit = any(
+        choice.known_dead_end
+        or choice.enters_dead_end
+        or choice.immediate_reverse
+        or choice.monster_distance_gain < 0
+        for choice in choices
+    )
+    if safe_unvisited or safe_exit_progress or not risky_commit:
+        return False
+    current_threat_distance = _path_distance(env, env.player, threat_position)
+    for choice in choices:
+        if choice.wait_action or choice.known_dead_end or choice.enters_dead_end:
+            continue
+        if choice.visits == 0 and choice.monster_distance_gain >= 0:
+            return False
+        if choice.exit_distance < current_exit_distance and choice.monster_distance_gain >= 0:
+            return False
+    return current_threat_distance >= max(5, env.player_vision_range)
+
+
+def _monster_recently_seen(env: MazeEnv) -> bool:
+    """Return whether the monster was seen recently enough to maintain threat memory."""
+
+    turns_since_seen = getattr(env, "turns_since_monster_seen", None)
+    return turns_since_seen is not None and turns_since_seen <= 3
+
+
+def _threat_reference_position(env: MazeEnv) -> Position | None:
+    """Return the visible monster or a recent last-seen threat position."""
+
+    if env.monster is not None and env.monster in env.visible_open_cells:
+        return env.monster
+    if _monster_recently_seen(env):
+        return getattr(env, "last_seen_monster_position", None)
+    return None
 
 
 def _choice_priority(choice: HeuristicMoveChoice, fear_mode: bool) -> tuple[Any, ...]:
@@ -223,23 +441,37 @@ def _choice_priority(choice: HeuristicMoveChoice, fear_mode: bool) -> tuple[Any,
 
     if fear_mode:
         return (
-            choice.monster_distance_gain <= 0,
+            choice.monster_distance <= 1,
+            choice.monster_distance_gain < 0,
+            not choice.wait_action and choice.monster_distance_gain == 0,
             -choice.monster_distance_gain,
-            choice.immediate_reverse,
-            choice.short_loop_risk,
+            -choice.monster_distance,
+            -choice.speed,
+            choice.known_dead_end and choice.monster_distance_gain <= 0,
+            choice.enters_dead_end,
+            choice.nearest_unvisited_distance,
             choice.visits > 0,
             choice.visits,
+            not choice.direct_monster_escape,
+            choice.immediate_reverse and choice.monster_distance_gain <= 0,
+            choice.short_loop_risk if choice.monster_distance_gain <= 0 else 0,
             choice.exit_distance,
-            choice.nearest_unvisited_distance,
             choice.direction,
         )
     return (
+        choice.known_dead_end,
+        choice.monster_distance <= 1,
+        choice.enters_dead_end,
         choice.visits > 0,
         choice.visits,
         choice.nearest_unvisited_distance,
-        choice.exit_distance,
+        -choice.speed,
+        choice.wait_action,
         choice.immediate_reverse,
         choice.short_loop_risk,
+        choice.monster_distance_gain < 0,
+        choice.exit_distance,
+        -choice.monster_distance,
         choice.direction,
     )
 
@@ -270,6 +502,16 @@ def should_override_policy(
     if chosen.immediate_reverse and not best.immediate_reverse:
         return True
     if chosen.short_loop_risk >= 6 and chosen.short_loop_risk > best.short_loop_risk:
+        return True
+    if chosen.known_dead_end and not best.known_dead_end:
+        return True
+    if chosen.enters_dead_end and not best.enters_dead_end:
+        return True
+    if not chosen.direct_monster_escape and best.direct_monster_escape and best.monster_distance_gain > 0:
+        return True
+    if chosen.monster_distance <= 1 and best.monster_distance > chosen.monster_distance:
+        return True
+    if chosen.monster_distance_gain < 0 <= best.monster_distance_gain:
         return True
     if chosen.monster_distance_gain < best.monster_distance_gain and best.monster_distance_gain > 0:
         return True
@@ -330,6 +572,10 @@ def _decorate_committed_state(
     action_direction: int | None,
     action_speed: int | None,
     peak_no_progress_streak: int,
+    policy_kind: str = "trained",
+    policy_override_enabled: bool = False,
+    policy_override_count: int = 0,
+    policy_override_reason: str | None = None,
 ) -> dict[str, Any]:
     """Build the authoritative committed state for one completed turn."""
 
@@ -350,6 +596,15 @@ def _decorate_committed_state(
             "capture_diagnostics": capture_diagnostics,
             "replay_turn": replay_turn,
             "turn_step": turn_step,
+            "policy_kind": policy_kind,
+            "policy_override_enabled": policy_override_enabled,
+            "policy_override_count": policy_override_count,
+            "policy_override_reason": policy_override_reason,
+            "policy_decision_label": _policy_decision_label(
+                policy_kind,
+                policy_override_enabled,
+                policy_override_reason,
+            ),
             "current_micro_step": 0,
             "micro_step_count": 0,
             "micro_actor": None,
@@ -435,6 +690,7 @@ class PlaybackSession:
     max_no_progress_streak: int = 25
     wall_time_timeout_s: float = 30.0
     debug_trace: bool = False
+    allow_policy_override: bool = False
 
     def __post_init__(self) -> None:
         self.model, self.env, _ = load_checkpoint_for_playback(self.checkpoint_path)
@@ -449,6 +705,7 @@ class PlaybackSession:
         self.pending_states: list[dict[str, Any]] = []
         self.pending_result: ShowcaseResult | None = None
         self.last_override_reason: str | None = None
+        self.policy_override_count = 0
         self.latest_state = _decorate_committed_state(
             checkpoint_label=self.checkpoint_label,
             snapshot=self.env.get_render_state(),
@@ -463,6 +720,10 @@ class PlaybackSession:
             action_direction=None,
             action_speed=None,
             peak_no_progress_streak=0,
+            policy_kind="trained",
+            policy_override_enabled=self.allow_policy_override,
+            policy_override_count=0,
+            policy_override_reason=None,
         )
         self.recorded_frames: list[dict[str, Any]] = [deepcopy(self.latest_state)]
 
@@ -495,8 +756,13 @@ class PlaybackSession:
         chosen_move = describe_move_choice(self.env, int(action))
         best_move = ranked_moves[0] if ranked_moves else None
         self.last_override_reason = None
-        if should_override_policy(chosen_move, best_move, chosen_confidence, confidence_gap):
+        should_override = should_override_policy(chosen_move, best_move, chosen_confidence, confidence_gap)
+        override_applied = False
+        if self.allow_policy_override and should_override and best_move is not None:
             action = best_move.action
+            override_applied = True
+            self.policy_override_count += 1
+            self.last_override_reason = "heuristic-override"
             if chosen_move is not None and best_move is not None:
                 if chosen_move.visits > 0 and best_move.visits == 0:
                     self.last_override_reason = "prefer-unvisited"
@@ -506,8 +772,13 @@ class PlaybackSession:
                     self.last_override_reason = "break-loop"
                 else:
                     self.last_override_reason = "low-confidence"
-        direction, speed = self.env.decode_action(int(action))
-        self.observation, _, terminated, truncated, info = self.env.step(int(action))
+        if int(action) == WAIT_ACTION:
+            direction = None
+            speed = 0
+            self.observation, _, terminated, truncated, info = self.env.step_wait()
+        else:
+            direction, speed = self.env.decode_action(int(action))
+            self.observation, _, terminated, truncated, info = self.env.step(int(action))
         self.episode_start = np.array([terminated or truncated], dtype=bool)
 
         frontier_count = int(info.get("frontier_cells_visited", 0))
@@ -532,9 +803,11 @@ class PlaybackSession:
             action_direction=direction,
             action_speed=speed,
             peak_no_progress_streak=max(self.env.peak_no_progress_steps, self.no_progress_streak),
+            policy_kind="heuristic-override" if override_applied else "trained",
+            policy_override_enabled=self.allow_policy_override,
+            policy_override_count=self.policy_override_count,
+            policy_override_reason=self.last_override_reason,
         )
-        committed_state["policy_kind"] = "trained"
-        committed_state["policy_override_reason"] = self.last_override_reason
         self.pending_states = _build_microstep_frames(committed_state=committed_state, replay_turn=replay_turn)
 
         if self.debug_trace:
@@ -567,6 +840,8 @@ class PlaybackSession:
                 final_state=deepcopy(committed_state),
                 checkpoint_path=str(self.checkpoint_path),
                 seed=self.seed,
+                policy_override_count=self.policy_override_count,
+                last_override_reason=self.last_override_reason,
             )
         if not self.pending_states:
             self.pending_states = [deepcopy(committed_state)]
@@ -614,6 +889,10 @@ class BaselinePlaybackSession:
             action_direction=None,
             action_speed=None,
             peak_no_progress_streak=0,
+            policy_kind="innate",
+            policy_override_enabled=False,
+            policy_override_count=0,
+            policy_override_reason=None,
         )
         self.recorded_frames: list[dict[str, Any]] = [deepcopy(self.latest_state)]
 
@@ -633,8 +912,13 @@ class BaselinePlaybackSession:
             return self.latest_state, None
 
         action = self._choose_legal_action()
-        direction, speed = self.env.decode_action(int(action))
-        self.observation, _, terminated, truncated, info = self.env.step(int(action))
+        if int(action) == WAIT_ACTION:
+            direction = None
+            speed = 0
+            self.observation, _, terminated, truncated, info = self.env.step_wait()
+        else:
+            direction, speed = self.env.decode_action(int(action))
+            self.observation, _, terminated, truncated, info = self.env.step(int(action))
 
         frontier_count = int(info.get("frontier_cells_visited", 0))
         if frontier_count > self.last_frontier_count:
@@ -658,8 +942,11 @@ class BaselinePlaybackSession:
             action_direction=direction,
             action_speed=speed,
             peak_no_progress_streak=max(self.env.peak_no_progress_steps, self.no_progress_streak),
+            policy_kind="innate",
+            policy_override_enabled=False,
+            policy_override_count=0,
+            policy_override_reason=None,
         )
-        committed_state["policy_kind"] = "innate"
         self.pending_states = _build_microstep_frames(committed_state=committed_state, replay_turn=replay_turn)
 
         if self.debug_trace:
@@ -728,17 +1015,27 @@ def run_checkpoint_showcase_episode(
     wall_time_timeout_s: float = 30.0,
     on_step: Callable[[dict[str, Any]], bool] | None = None,
     debug_trace: bool = False,
+    allow_policy_override: bool = False,
 ) -> ShowcaseResult:
     """Run one deterministic checkpoint episode with guardrails."""
 
-    session = PlaybackSession(
-        checkpoint_path=checkpoint_path,
-        checkpoint_label=checkpoint_label,
-        seed=seed,
-        max_no_progress_streak=max_no_progress_streak,
-        wall_time_timeout_s=wall_time_timeout_s,
-        debug_trace=debug_trace,
-    )
+    try:
+        session = PlaybackSession(
+            checkpoint_path=checkpoint_path,
+            checkpoint_label=checkpoint_label,
+            seed=seed,
+            max_no_progress_streak=max_no_progress_streak,
+            wall_time_timeout_s=wall_time_timeout_s,
+            debug_trace=debug_trace,
+            allow_policy_override=allow_policy_override,
+        )
+    except CheckpointCompatibilityError as error:
+        return build_incompatible_result(
+            checkpoint_label=checkpoint_label,
+            checkpoint_path=checkpoint_path,
+            seed=seed,
+            reason=str(error),
+        )
     while True:
         state, result = session.advance()
         if on_step is not None and not on_step(state):
@@ -763,6 +1060,8 @@ def run_checkpoint_showcase_episode(
                 final_state=state,
                 checkpoint_path=str(checkpoint_path),
                 seed=seed,
+                policy_override_count=session.policy_override_count,
+                last_override_reason=session.last_override_reason,
                 notes="playback aborted by viewer",
             )
         if result is not None:
@@ -797,6 +1096,39 @@ def build_missing_result(checkpoint_episode: int, checkpoint_path: str | Path, s
     )
 
 
+def build_incompatible_result(
+    checkpoint_label: str,
+    checkpoint_path: str | Path,
+    seed: int,
+    reason: str,
+) -> ShowcaseResult:
+    """Build a skipped row for a checkpoint that no longer matches the env shape."""
+
+    return ShowcaseResult(
+        checkpoint=checkpoint_label,
+        status="incompatible",
+        outcome="incompatible",
+        escape_rate=0.0,
+        coverage=0.0,
+        steps=0,
+        revisits=0,
+        oscillations=0,
+        dead_ends=0,
+        start_monster_distance=None,
+        time_to_capture=None,
+        frontier_rate=0.0,
+        peak_no_progress_streak=0,
+        final_player_position=None,
+        final_monster_position=None,
+        final_distance=None,
+        capture_rule=None,
+        final_state=None,
+        checkpoint_path=str(checkpoint_path),
+        seed=seed,
+        notes=reason,
+    )
+
+
 def run_showcase_headless(
     checkpoint_dir: str | Path,
     checkpoints: list[int],
@@ -804,6 +1136,7 @@ def run_showcase_headless(
     max_no_progress_streak: int = 25,
     wall_time_timeout_s: float = 30.0,
     debug_trace: bool = False,
+    allow_policy_override: bool = False,
 ) -> list[ShowcaseResult]:
     """Run a sequential headless showcase over checkpoint episodes."""
 
@@ -821,6 +1154,7 @@ def run_showcase_headless(
                 max_no_progress_streak=max_no_progress_streak,
                 wall_time_timeout_s=wall_time_timeout_s,
                 debug_trace=debug_trace,
+                allow_policy_override=allow_policy_override,
             )
         )
     return results

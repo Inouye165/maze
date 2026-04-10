@@ -15,16 +15,29 @@ from typing import Any, Callable
 import pygame
 
 from maze_rl.config import MazeConfig, maze_config_from_dict
+from maze_rl.policies.model_factory import CheckpointCompatibilityError
 from maze_rl.render.view_state import (
     viewer_cell_color,
+    viewer_dead_end_cells,
+    viewer_explored_cells,
     viewer_exit_position,
     viewer_grid,
     viewer_monster_position,
+    viewer_policy_badge,
     viewer_player_position,
+    viewer_traveled_cells,
     viewer_visible_cells,
 )
 from maze_rl.training.checkpointing import checkpoint_is_complete, latest_checkpoint, list_checkpoints, load_checkpoint_metadata, resolve_checkpoint_path
-from maze_rl.training.showcase import BaselinePlaybackSession, PlaybackSession, RecordedPlaybackSession, RecordedRun, ShowcaseResult, build_missing_result
+from maze_rl.training.showcase import (
+    BaselinePlaybackSession,
+    PlaybackSession,
+    RecordedPlaybackSession,
+    RecordedRun,
+    ShowcaseResult,
+    build_incompatible_result,
+    build_missing_result,
+)
 from maze_rl.training.train import continue_training_from_latest, format_training_progress, maze_config_for_training_mode
 
 QUIT = getattr(pygame, "QUIT", 256)
@@ -245,12 +258,22 @@ class LabAppController:
         episode, checkpoint_path = selected
         seed = self.parse_seed()
         self._clear_compare_state()
-        self.session = PlaybackSession(
-            checkpoint_path=checkpoint_path,
-            checkpoint_label=f"ckpt {episode:04d}",
-            seed=seed,
-            debug_trace=self.debug_trace,
-        )
+        try:
+            self.session = PlaybackSession(
+                checkpoint_path=checkpoint_path,
+                checkpoint_label=f"ckpt {episode:04d}",
+                seed=seed,
+                debug_trace=self.debug_trace,
+                allow_policy_override=True,
+            )
+        except CheckpointCompatibilityError:
+            self.session = None
+            self.last_result = None
+            self.last_state = None
+            self.training_message = (
+                f"ckpt {episode:04d} is incompatible with the current observation shape; retrain on this branch"
+            )
+            return
         self.current_mode = "current-learned-ai"
         self.selected_mode = "current-learned-ai"
         self.last_result = None
@@ -496,12 +519,24 @@ class LabAppController:
             if not checkpoint_is_complete(entry.checkpoint_path):
                 self.compare_results.append(build_missing_result(entry.checkpoint_episode, entry.checkpoint_path, self.parse_seed()))
                 continue
-            self.session = PlaybackSession(
-                checkpoint_path=entry.checkpoint_path,
-                checkpoint_label=f"ckpt {entry.checkpoint_episode:04d}",
-                seed=self.parse_seed(),
-                debug_trace=self.debug_trace,
-            )
+            try:
+                self.session = PlaybackSession(
+                    checkpoint_path=entry.checkpoint_path,
+                    checkpoint_label=f"ckpt {entry.checkpoint_episode:04d}",
+                    seed=self.parse_seed(),
+                    debug_trace=self.debug_trace,
+                    allow_policy_override=True,
+                )
+            except CheckpointCompatibilityError as error:
+                self.compare_results.append(
+                    build_incompatible_result(
+                        checkpoint_label=f"ckpt {entry.checkpoint_episode:04d}",
+                        checkpoint_path=entry.checkpoint_path,
+                        seed=self.parse_seed(),
+                        reason=str(error),
+                    )
+                )
+                continue
             self.last_state = self.session.latest_state
             self.last_result = None
             self.training_message = f"compare running ckpt {entry.checkpoint_episode:04d}"
@@ -604,12 +639,14 @@ class LabAppController:
         latest_summary = self.latest_training_summary()
         last_outcome = self.last_result.outcome if self.last_result is not None else "none yet"
         cycles_seen = 0 if latest_summary is None else int(latest_summary.get("episodes_seen", 0))
+        active_seed = self.active_training_seed()
+        seed_suffix = "" if active_seed is None else f" | Live train seed: {active_seed}"
         return [
             f"Seed: {self.parse_seed()} | Train cycles: {self.parse_cycle_count()}",
             f"Play mode: {self.play_mode_status()} | Last outcome: {last_outcome}",
             f"Training mode: {self.training_mode_label()} | Current view: {self.mode_label()}",
             f"Training status: {self.training_status} | Cycles completed: {cycles_seen}",
-            f"Status: {self.training_message}",
+            f"Status: {self.training_message}{seed_suffix}",
         ]
 
     def training_progress_summary(self) -> str:
@@ -625,6 +662,10 @@ class LabAppController:
         active_cycle = int(progress.get("active_cycle", completed))
         episode_steps = int(progress.get("episode_steps", 0))
         parts = [f"Training progress: cycle {active_cycle} | move {episode_steps} | {completed}/{target} ({percent:.1f}%)"]
+
+        maze_seed = progress.get("maze_seed")
+        if maze_seed is not None:
+            parts.append(f"seed {int(maze_seed)}")
 
         current_seconds = progress.get("current_episode_elapsed_seconds")
         if isinstance(current_seconds, (int, float)):
@@ -643,6 +684,40 @@ class LabAppController:
             parts.append(f"no-progress {no_progress_steps}")
 
         return " | ".join(parts)
+
+    def active_training_seed(self) -> int | None:
+        """Return the current live training seed when a training cycle is active."""
+
+        progress = self.training_progress
+        if not progress:
+            return None
+        maze_seed = progress.get("maze_seed")
+        return int(maze_seed) if maze_seed is not None else None
+
+    def training_preview_state(self) -> dict[str, Any] | None:
+        """Return the live training snapshot to render while training is active."""
+
+        if not self.is_training_active:
+            return None
+        progress = self.training_progress
+        if not progress:
+            return None
+        snapshot = progress.get("state_snapshot")
+        if not isinstance(snapshot, dict):
+            return None
+        preview = dict(snapshot)
+        preview["checkpoint_label"] = f"training {self.training_mode}"
+        preview["policy_decision_label"] = "live training maze"
+        preview["policy_kind"] = "innate"
+        return preview
+
+    def render_state(self) -> dict[str, Any] | None:
+        """Return the state that should currently drive the main maze panel."""
+
+        training_preview = self.training_preview_state()
+        if training_preview is not None:
+            return training_preview
+        return self.last_state
 
     def training_progress_ratio(self) -> float:
         """Return a 0..1 completion ratio for the active training run."""
@@ -667,6 +742,7 @@ class LabAppController:
                     f"Frontier rate: {latest_summary.get('recent_frontier_reached_rate', 0.0):.2f} | Illegal moves: {latest_summary.get('recent_average_illegal_moves', 0.0):.1f}",
                     f"Revisits: {latest_summary.get('recent_average_revisits', 0.0):.1f} | Oscillations: {latest_summary.get('recent_average_oscillations', 0.0):.1f}",
                     f"Timeouts: {latest_summary.get('timeout_count', 0)} | Stalls: {latest_summary.get('stall_count', 0)}",
+                    f"Avoidable captures: {latest_summary.get('avoidable_capture_count', 0)} | Recent avoidable rate: {latest_summary.get('recent_avoidable_capture_rate', 0.0):.2f}",
                 ]
             )
         if self.last_result is not None:
@@ -1032,7 +1108,7 @@ class LabControlApp:
     def _draw_game_area(self, screen: Any) -> None:
         inner = self.game_area.inflate(-18, -18)
         pygame.draw.rect(screen, (255, 252, 247), inner, border_radius=24)
-        state = self.controller.last_state
+        state = self.controller.render_state()
         if state is None or not state.get("grid"):
             title = self.title_font.render("Watch the maze before training", True, (46, 57, 71))
             screen.blit(title, (self.game_area.x + 30, self.game_area.y + 30))
@@ -1054,6 +1130,9 @@ class LabControlApp:
 
         grid = viewer_grid(state)
         visible_cells = viewer_visible_cells(state)
+        explored_cells = viewer_explored_cells(state)
+        traveled_cells = viewer_traveled_cells(state)
+        dead_end_cells = viewer_dead_end_cells(state)
         rows = len(grid)
         cols = len(grid[0])
         cell_size = min((self.game_area.width - 64) // cols, (self.game_area.height - 224) // rows)
@@ -1064,7 +1143,14 @@ class LabControlApp:
         for row_index, row in enumerate(grid):
             for col_index, cell in enumerate(row):
                 rect = pygame.Rect(offset_x + col_index * cell_size, offset_y + row_index * cell_size, cell_size - 1, cell_size - 1)
-                color = viewer_cell_color(cell, (row_index, col_index) in visible_cells)
+                position = (row_index, col_index)
+                color = viewer_cell_color(
+                    cell,
+                    position in visible_cells,
+                    is_explored=position in explored_cells,
+                    is_traveled=position in traveled_cells,
+                    is_dead_end=position in dead_end_cells,
+                )
                 pygame.draw.rect(screen, color, rect)
 
         player_visible = bool(state.get("player_visible", True))
@@ -1085,13 +1171,25 @@ class LabControlApp:
         overlay_rect = pygame.Rect(self.game_area.x + 24, board_rect.bottom + 18, self.game_area.width - 48, self.game_area.bottom - board_rect.bottom - 32)
         pygame.draw.rect(screen, (244, 239, 229), overlay_rect, border_radius=18)
         pygame.draw.rect(screen, (214, 204, 188), overlay_rect, width=1, border_radius=18)
+        badge_label, badge_color, badge_text_color = viewer_policy_badge(state)
+        badge_rect = pygame.Rect(overlay_rect.x + 18, overlay_rect.y + 14, min(380, max(190, len(badge_label) * 10)), 30)
+        pygame.draw.rect(screen, badge_color, badge_rect, border_radius=10)
+        badge_text = self.font.render(badge_label, True, badge_text_color)
+        screen.blit(badge_text, (badge_rect.x + 10, badge_rect.y + 5))
+        training_preview = self.controller.training_preview_state() is not None
         overlay_lines = [
-            f"Mode: {self.controller.mode_label()} | Seed: {state.get('seed')} | Checkpoint: {state.get('checkpoint_label')}",
+            f"Mode: {'Training Preview' if training_preview else self.controller.mode_label()} | Seed: {state.get('seed')} | Checkpoint: {state.get('checkpoint_label')}",
             f"Turn: {state.get('turn_step', state.get('steps'))} | Outcome: {state.get('outcome')} | Coverage: {state.get('coverage', 0.0):.2f}",
             f"Human: {rendered_player if player_visible else 'hidden'} | Monster: {rendered_monster} | Exit: {exit_position}",
             f"Seen cells: {state.get('discovered_cells', 0)} | Vision-shaded cells: {len(visible_cells)} | NPC sees monster: {npc_monster_visible} | Exit seen: {state.get('exit_seen', False)}",
             f"Distance: {state.get('player_monster_distance')} | Repeat streak: {state.get('repeat_move_streak', 0)} | Micro-step: {state.get('current_micro_step', 0)}/{state.get('micro_step_count', 0)} | Speed: {self.controller.speed_options[self.controller.speed_index][0]}",
+            (
+                f"Policy: {state.get('policy_kind', 'trained')} | Override enabled: {state.get('policy_override_enabled', False)} | "
+                f"Override count: {state.get('policy_override_count', 0)} | Reason: {state.get('policy_override_reason', 'n/a')}"
+            ),
         ]
+        if training_preview:
+            overlay_lines.append("This is the live maze being used for the current training cycle. It updates as the cycle and seed change.")
         if self.controller.last_result is not None:
             overlay_lines.append(
                 f"Last finished run: {self.controller.last_result.outcome} | Steps {self.controller.last_result.steps} | Revisits {self.controller.last_result.revisits} | Oscillations {self.controller.last_result.oscillations} | Peak repeat {state.get('peak_repeat_move_streak', 0)}"
@@ -1104,7 +1202,7 @@ class LabControlApp:
                     f"Debug actor={state.get('micro_actor')} | phase={state.get('micro_phase')} | action={state.get('action_index')} dir={state.get('action_direction')} speed={state.get('action_speed')}",
                 ]
             )
-        self._draw_wrapped_text(screen, self.font, overlay_lines, (57, 63, 75), overlay_rect.inflate(-18, -14), line_gap=4)
+        self._draw_wrapped_text(screen, self.font, overlay_lines, (57, 63, 75), pygame.Rect(overlay_rect.x + 18, overlay_rect.y + 50, overlay_rect.width - 36, overlay_rect.height - 64), line_gap=4)
 
     def _draw_panel(self, screen: Any) -> None:
         layout = self._panel_layout()

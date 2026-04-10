@@ -17,7 +17,7 @@ class ObservationSpec:
     rows: int
     cols: int
     cell_channels: int = 6
-    scalar_features: int = 13
+    scalar_features: int = 29
     visit_clip: int = 4
 
     @property
@@ -70,6 +70,7 @@ def encode_observation(
     revisit_ratio: float,
     oscillation_ratio: float,
     dead_end_ratio: float,
+    direction_features: tuple[float, ...],
 ) -> np.ndarray:
     """Encode the current environment state into a fixed vector."""
 
@@ -110,6 +111,7 @@ def encode_observation(
         revisit_ratio,
         oscillation_ratio,
         dead_end_ratio,
+        *direction_features,
         *direction_one_hot,
         min(1.0, last_speed / 10.0),
         _normalized_distance(player, layout.exit_position, layout.rows, layout.cols),

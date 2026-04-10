@@ -17,6 +17,10 @@ class EpisodeMetrics:
     coverage: float
     revisits: int
     oscillations: int
+    visible_dead_end_opportunities: int
+    entered_visible_dead_end: int
+    avoided_visible_dead_end: int
+    avoidable_visible_dead_end_penalties_applied: int
     dead_end_entries: int
     blocked_moves: int
     discovered_cells: int
@@ -33,6 +37,8 @@ class EpisodeMetrics:
     frontier_cells_visited: int
     reached_new_frontier: bool
     peak_no_progress_steps: int
+    avoidable_capture: bool
+    avoidable_capture_reason: str | None
     curriculum_stage: str
     monster_speed: int
     monster_activation_delay: int
@@ -55,6 +61,7 @@ class RollingTrainingSummary:
         self.total_wins = 0
         self.total_timeouts = 0
         self.total_stalls = 0
+        self.total_avoidable_captures = 0
         self.episodes: deque[EpisodeMetrics] = deque(maxlen=window_size)
 
     def add(self, metrics: EpisodeMetrics) -> None:
@@ -67,6 +74,8 @@ class RollingTrainingSummary:
             self.total_timeouts += 1
         if metrics.outcome == "stall":
             self.total_stalls += 1
+        if metrics.avoidable_capture:
+            self.total_avoidable_captures += 1
         self.episodes.append(metrics)
 
     def snapshot(self) -> dict[str, Any]:
@@ -80,6 +89,7 @@ class RollingTrainingSummary:
             "win_rate": self.total_wins / max(1, self.total_episodes),
             "timeout_count": self.total_timeouts,
             "stall_count": self.total_stalls,
+            "avoidable_capture_count": self.total_avoidable_captures,
             "recent_window_size": self.window_size,
             "recent_count": len(window),
             "recent_win_rate": mean([item.outcome == "escaped" for item in window]) if window else 0.0,
@@ -88,6 +98,15 @@ class RollingTrainingSummary:
             "recent_average_steps": mean([item.steps for item in window]) if window else 0.0,
             "recent_average_revisits": mean([item.revisits for item in window]) if window else 0.0,
             "recent_average_oscillations": mean([item.oscillations for item in window]) if window else 0.0,
+            "recent_average_visible_dead_end_opportunities": (
+                mean([item.visible_dead_end_opportunities for item in window]) if window else 0.0
+            ),
+            "recent_average_entered_visible_dead_ends": (
+                mean([item.entered_visible_dead_end for item in window]) if window else 0.0
+            ),
+            "recent_average_avoided_visible_dead_ends": (
+                mean([item.avoided_visible_dead_end for item in window]) if window else 0.0
+            ),
             "recent_average_dead_ends": mean([item.dead_end_entries for item in window]) if window else 0.0,
             "recent_average_illegal_moves": mean([item.blocked_moves for item in window]) if window else 0.0,
             "recent_average_time_to_capture": (
@@ -109,6 +128,7 @@ class RollingTrainingSummary:
             ),
             "recent_timeout_rate": mean([item.timed_out for item in window]) if window else 0.0,
             "recent_stall_rate": mean([item.stalled for item in window]) if window else 0.0,
+            "recent_avoidable_capture_rate": mean([item.avoidable_capture for item in window]) if window else 0.0,
             "recent_outcomes": recent_outcomes,
             "recent_10_outcomes": recent_outcomes[-10:],
             "recent_50_outcomes": recent_outcomes,

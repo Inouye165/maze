@@ -18,6 +18,7 @@ class StepEvent:
     oscillations: int
     oscillation_severity: int
     dead_end_entries: int
+    avoidable_visible_dead_end_entries: int
     blocked_moves: int
     exit_progress_delta: float
     monster_distance_delta: float
@@ -36,6 +37,7 @@ class RewardBreakdown:
     revisit: float
     oscillation: float
     dead_end: float
+    avoidable_visible_dead_end: float
     blocking: float
     progress: float
     safety: float
@@ -50,6 +52,9 @@ def compute_reward(config: RewardConfig, event: StepEvent) -> RewardBreakdown:
     revisit = config.revisit_penalty * event.revisits + config.revisit_depth_penalty * event.revisit_depth
     oscillation = config.oscillation_penalty * event.oscillation_severity * event.oscillations
     dead_end = config.dead_end_penalty * event.dead_end_entries
+    avoidable_visible_dead_end = (
+        config.avoidable_visible_dead_end_penalty * event.avoidable_visible_dead_end_entries
+    )
     blocking = config.blocked_move_penalty * event.blocked_moves
     progress = config.exit_progress_reward * event.exit_progress_delta
 
@@ -70,13 +75,25 @@ def compute_reward(config: RewardConfig, event: StepEvent) -> RewardBreakdown:
         terminal += config.stall_penalty
 
     survival = config.survival_reward
-    total = exploration + revisit + oscillation + dead_end + blocking + progress + safety + terminal + survival
+    total = (
+        exploration
+        + revisit
+        + oscillation
+        + dead_end
+        + avoidable_visible_dead_end
+        + blocking
+        + progress
+        + safety
+        + terminal
+        + survival
+    )
     return RewardBreakdown(
         total=total,
         exploration=exploration,
         revisit=revisit,
         oscillation=oscillation,
         dead_end=dead_end,
+        avoidable_visible_dead_end=avoidable_visible_dead_end,
         blocking=blocking,
         progress=progress,
         safety=safety,
