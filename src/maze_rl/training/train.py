@@ -12,10 +12,20 @@ from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv
 
-from maze_rl.config import MazeConfig, RewardConfig, TrainingConfig, maze_config_from_dict, training_config_from_dict
+from maze_rl.config import (
+    MazeConfig,
+    RewardConfig,
+    TrainingConfig,
+    maze_config_from_dict,
+    training_config_from_dict,
+)
 from maze_rl.envs.maze_env import MazeEnv
 from maze_rl.policies.model_factory import create_model, load_model_from_checkpoint
-from maze_rl.training.checkpointing import CheckpointManager, latest_checkpoint, load_checkpoint_metadata
+from maze_rl.training.checkpointing import (
+    CheckpointManager,
+    latest_checkpoint,
+    load_checkpoint_metadata,
+)
 from maze_rl.training.evaluate import evaluate_model
 from maze_rl.training.metrics import EpisodeMetrics, RollingTrainingSummary
 
@@ -52,7 +62,9 @@ class ImmutableCheckpointCallback(BaseCallback):
         self.maze_config = maze_config
         self.summary = RollingTrainingSummary()
         self.completed_episodes = start_episode
-        self.target_episode = target_episode if target_episode is not None else training_config.episodes
+        self.target_episode = (
+            target_episode if target_episode is not None else training_config.episodes
+        )
         self.save_initial_checkpoint = save_initial_checkpoint
         self.stop_event = stop_event
         self.progress_callback = progress_callback
@@ -60,6 +72,7 @@ class ImmutableCheckpointCallback(BaseCallback):
         self.report_every_seconds = report_every_seconds
         self.report_no_progress_steps = report_no_progress_steps
         self.last_saved_episode = start_episode if not save_initial_checkpoint else -1
+        self._session_start_episode = start_episode
         self._started_at = time.monotonic()
         self._current_episode_started_at = self._started_at
         self._last_progress_timesteps = 0
@@ -110,6 +123,9 @@ class ImmutableCheckpointCallback(BaseCallback):
             "status": status,
             "completed_episodes": completed,
             "target_episodes": target,
+            "session_start_episode": self._session_start_episode,
+            "session_completed_episodes": completed - self._session_start_episode,
+            "session_target_episodes": target - self._session_start_episode,
             "active_cycle": active_cycle,
             "progress_ratio": completed / target,
             "maze_seed": int(info.get("maze_seed", 0)) if info is not None else None,
@@ -118,16 +134,30 @@ class ImmutableCheckpointCallback(BaseCallback):
             "episode_steps": int(snapshot.get("steps", 0)),
             "coverage": float(info.get("coverage", 0.0)) if info is not None else 0.0,
             "outcome": info.get("outcome", "running") if info is not None else "running",
-            "no_progress_steps": int(info.get("no_progress_steps", 0)) if info is not None else 0,
-            "peak_no_progress_steps": int(info.get("peak_no_progress_steps", 0)) if info is not None else 0,
-            "repeat_move_streak": int(info.get("repeat_move_streak", 0)) if info is not None else 0,
-            "repeat_loop_detected": bool(info.get("repeat_loop_detected", False)) if info is not None else False,
-            "avoidable_capture": bool(info.get("avoidable_capture", False)) if info is not None else False,
-            "avoidable_capture_reason": info.get("avoidable_capture_reason") if info is not None else None,
+            "no_progress_steps": (
+                int(info.get("no_progress_steps", 0)) if info is not None else 0
+            ),
+            "peak_no_progress_steps": (
+                int(info.get("peak_no_progress_steps", 0)) if info is not None else 0
+            ),
+            "repeat_move_streak": (
+                int(info.get("repeat_move_streak", 0)) if info is not None else 0
+            ),
+            "repeat_loop_detected": (
+                bool(info.get("repeat_loop_detected", False)) if info is not None else False
+            ),
+            "avoidable_capture": (
+                bool(info.get("avoidable_capture", False)) if info is not None else False
+            ),
+            "avoidable_capture_reason": (
+                info.get("avoidable_capture_reason") if info is not None else None
+            ),
             "recent_win_rate": snapshot_summary["recent_win_rate"],
             "recent_stall_rate": snapshot_summary["recent_stall_rate"],
             "recent_timeout_rate": snapshot_summary["recent_timeout_rate"],
-            "recent_avoidable_capture_rate": snapshot_summary["recent_avoidable_capture_rate"],
+            "recent_avoidable_capture_rate": (
+                snapshot_summary["recent_avoidable_capture_rate"]
+            ),
             "recent_average_coverage": snapshot_summary["recent_average_coverage"],
             "elapsed_seconds": elapsed_seconds,
             "current_episode_elapsed_seconds": now - self._current_episode_started_at,
@@ -152,7 +182,10 @@ class ImmutableCheckpointCallback(BaseCallback):
             self._emit_progress(info, status="running")
             return
 
-        if no_progress_steps >= self.report_no_progress_steps and no_progress_steps != self._last_progress_no_progress_steps:
+        if (
+            no_progress_steps >= self.report_no_progress_steps
+            and no_progress_steps != self._last_progress_no_progress_steps
+        ):
             self._last_progress_no_progress_steps = no_progress_steps
             self._emit_progress(info, status="no-progress")
 
@@ -167,7 +200,10 @@ class ImmutableCheckpointCallback(BaseCallback):
                 self._emit_progress(info, status=metrics.outcome)
                 self._current_episode_started_at = time.monotonic()
                 if self.manager.should_save(self.completed_episodes):
-                    self._save_checkpoint(episode=self.completed_episodes, timesteps=self.num_timesteps)
+                    self._save_checkpoint(
+                        episode=self.completed_episodes,
+                        timesteps=self.num_timesteps,
+                    )
                 if self.completed_episodes >= self.target_episode:
                     return False
         if self.stop_event is not None and self.stop_event.is_set():
@@ -219,14 +255,28 @@ def continue_training_from_latest(
     additional_episodes: int,
     checkpoint_dir: str | Path = "checkpoints",
     training_mode: str = "maze-only",
+    fixed_maze_seed: int | None = None,
     stop_event: threading.Event | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> TrainingArtifacts:
     """Continue training from the latest available checkpoint, or start fresh if none exists."""
 
+    def _with_fixed_seed(maze_config: MazeConfig) -> MazeConfig:
+        if fixed_maze_seed is None:
+            return maze_config
+        return MazeConfig(
+            **{
+                **maze_config.__dict__,
+                "fixed_maze_seed": int(fixed_maze_seed),
+                "train_seed_base": int(fixed_maze_seed),
+            }
+        )
+
     latest = latest_checkpoint(checkpoint_dir)
     if latest is None:
-        base_config = maze_config_for_training_mode(MazeConfig(), training_mode)
+        base_config = _with_fixed_seed(
+            maze_config_for_training_mode(MazeConfig(), training_mode)
+        )
         return train_from_scratch(
             TrainingConfig(
                 episodes=additional_episodes,
@@ -243,9 +293,11 @@ def continue_training_from_latest(
 
     latest_episode, checkpoint_path = latest
     metadata = load_checkpoint_metadata(checkpoint_path)
-    maze_config = maze_config_for_training_mode(
-        maze_config_from_dict(metadata["maze_config"]),
-        training_mode,
+    maze_config = _with_fixed_seed(
+        maze_config_for_training_mode(
+            maze_config_from_dict(metadata["maze_config"]),
+            training_mode,
+        )
     )
     previous_training_config = training_config_from_dict(metadata["training_config"])
     if previous_training_config.algorithm != "maskable_ppo":
@@ -257,7 +309,9 @@ def continue_training_from_latest(
                     algorithm="maskable_ppo",
                     seed=previous_training_config.seed,
                     n_steps=64 if training_mode == "maze-only" else 128,
-                    learning_rate=3e-4 if training_mode == "maze-only" else 2.5e-4,
+                    learning_rate=(
+                        3e-4 if training_mode == "maze-only" else 2.5e-4
+                    ),
                     ent_coef=0.05 if training_mode == "maze-only" else 0.02,
                 ),
                 maze_config=maze_config,
@@ -265,8 +319,10 @@ def continue_training_from_latest(
                 progress_callback=progress_callback,
             )
         raise ValueError(
-            "Existing checkpoint uses plain PPO, so innate safety masks cannot be enforced during training. "
-            "Reset this training branch and retrain with maskable_ppo to preserve flee behavior."
+            "Existing checkpoint uses plain PPO, so innate safety masks cannot be "
+            "enforced during training. "
+            "Reset this training branch and retrain with maskable_ppo to preserve "
+            "flee behavior."
         )
     resumed_seed = previous_training_config.seed + latest_episode
     training_config = TrainingConfig(
@@ -276,7 +332,9 @@ def continue_training_from_latest(
             "episodes": latest_episode + additional_episodes,
             "seed": resumed_seed,
             "algorithm": "maskable_ppo",
-            "n_steps": 64 if training_mode == "maze-only" else previous_training_config.n_steps,
+            "n_steps": (
+                64 if training_mode == "maze-only" else previous_training_config.n_steps
+            ),
             "learning_rate": (
                 3e-4 if training_mode == "maze-only" else previous_training_config.learning_rate
             ),
@@ -299,7 +357,12 @@ def continue_training_from_latest(
         stop_event=stop_event,
         progress_callback=progress_callback,
     )
-    model.learn(total_timesteps=10_000_000, callback=callback, progress_bar=False, reset_num_timesteps=False)
+    model.learn(
+        total_timesteps=10_000_000,
+        callback=callback,
+        progress_bar=False,
+        reset_num_timesteps=False,
+    )
     return TrainingArtifacts(
         checkpoint_dir=training_config.checkpoint_dir,
         final_episode_count=callback.completed_episodes,

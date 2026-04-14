@@ -3,7 +3,7 @@
 from collections import deque
 
 from maze_rl.envs.entities import Position
-from maze_rl.envs.maze_generator import generate_maze
+from maze_rl.envs.maze_generator import _layout_is_winnable, generate_maze
 
 
 def _edge_count(grid: tuple[str, ...]) -> int:
@@ -115,7 +115,16 @@ def test_seeded_maze_generation_is_reproducible() -> None:
 def test_generated_maze_contains_loops_for_multiple_paths() -> None:
     """Generated mazes should include extra connections so routes are not single-path only."""
 
-    layout = generate_maze(seed=1001, rows=19, cols=19)
+    layout = generate_maze(
+        seed=1001,
+        rows=19,
+        cols=19,
+        max_player_speed=1,
+        monster_speed=1,
+        monster_activation_delay=0,
+        monster_move_interval=3,
+        max_episode_steps=280,
+    )
 
     assert _edge_count(layout.grid) >= _open_cell_count(layout.grid)
 
@@ -123,18 +132,74 @@ def test_generated_maze_contains_loops_for_multiple_paths() -> None:
 def test_generated_maze_preserves_many_dead_ends() -> None:
     """Generated mazes should stay branchy enough to retain many dead ends."""
 
-    layout = generate_maze(seed=1001, rows=19, cols=19)
+    layout = generate_maze(
+        seed=1001,
+        rows=19,
+        cols=19,
+        max_player_speed=1,
+        monster_speed=1,
+        monster_activation_delay=0,
+        monster_move_interval=3,
+        max_episode_steps=280,
+    )
 
     assert _dead_end_count(layout.grid) >= 11
 
 
-def test_generated_exit_route_sees_monster_at_least_once() -> None:
-    """The shortest route to the exit should expose the monster at least once."""
+def test_generated_exit_route_is_winnable_under_live_rules() -> None:
+    """The generated exit route should stay beatable under the live chase rules."""
 
-    layout = generate_maze(seed=1001, rows=19, cols=19, vision_range=4)
+    layout = generate_maze(
+        seed=1001,
+        rows=19,
+        cols=19,
+        vision_range=4,
+        max_player_speed=1,
+        monster_speed=1,
+        monster_activation_delay=0,
+        monster_move_interval=3,
+        max_episode_steps=280,
+    )
     path = _shortest_path(layout.grid, layout.player_start, layout.exit_position)
 
-    assert any(
-        _has_line_of_sight(layout.grid, position, layout.monster_start, 4)
-        for position in path
+    assert path[0] == layout.player_start
+    assert path[-1] == layout.exit_position
+    assert _layout_is_winnable(
+        layout.grid,
+        layout.player_start,
+        layout.monster_start,
+        layout.exit_position,
+        max_player_speed=1,
+        monster_speed=1,
+        monster_activation_delay=0,
+        monster_move_interval=3,
+        max_episode_steps=280,
     )
+
+
+def test_generated_mazes_are_winnable_under_live_maze_only_rules() -> None:
+    """Generated layouts should admit at least one winning route under chase rules."""
+
+    for seed in (1, 7, 42, 101, 1001):
+        layout = generate_maze(
+            seed=seed,
+            rows=19,
+            cols=19,
+            vision_range=4,
+            max_player_speed=1,
+            monster_speed=1,
+            monster_activation_delay=0,
+            monster_move_interval=3,
+            max_episode_steps=280,
+        )
+        assert _layout_is_winnable(
+            layout.grid,
+            layout.player_start,
+            layout.monster_start,
+            layout.exit_position,
+            max_player_speed=1,
+            monster_speed=1,
+            monster_activation_delay=0,
+            monster_move_interval=3,
+            max_episode_steps=280,
+        )

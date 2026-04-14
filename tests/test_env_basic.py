@@ -40,6 +40,33 @@ def test_env_reset_without_seed_draws_from_gym_rng() -> None:
     assert info["maze_seed"] != 10_001
 
 
+def test_env_focused_seed_runs_requested_seed_once_then_jumps_forward() -> None:
+    """Focused training should guarantee the requested seed once, then vary future mazes."""
+
+    config = MazeConfig(
+        train_seed_base=10_000,
+        fixed_maze_seed=222,
+        focused_seed_jump_max=1000,
+    )
+    env = MazeEnv(config, training_mode=True)
+    _, first_info = env.reset(seed=123)
+
+    expected_env = MazeEnv(config, training_mode=True)
+    _, expected_first_info = expected_env.reset(seed=123)
+    _, expected_second_info = expected_env.reset()
+    _, expected_third_info = expected_env.reset()
+
+    _, second_info = env.reset()
+    _, third_info = env.reset()
+
+    assert first_info["maze_seed"] == 222
+    assert first_info["maze_seed"] == expected_first_info["maze_seed"]
+    assert second_info["maze_seed"] == expected_second_info["maze_seed"]
+    assert third_info["maze_seed"] == expected_third_info["maze_seed"]
+    assert 1 <= second_info["maze_seed"] - first_info["maze_seed"] <= 1000
+    assert 1 <= third_info["maze_seed"] - second_info["maze_seed"] <= 1000
+
+
 def test_action_masks_block_corner_oscillation_when_better_move_exists() -> None:
     """Masking should drop short-loop backtracking when fresh space is available."""
 
@@ -277,6 +304,50 @@ def test_repeat_loop_indicator_penalizes_ping_pong_without_progress() -> None:
     assert last_info["outcome"] == "running"
 
 
+def test_repeat_loop_eventually_stalls_episode() -> None:
+    """Repeated ping-pong movement should hard-stop the episode instead of training forever."""
+
+    layout = MazeLayout(
+        grid=(
+            "#######",
+            "#.....#",
+            "#######",
+        ),
+        player_start=Position(1, 1),
+        monster_start=Position(1, 5),
+        exit_position=Position(1, 4),
+        seed=654,
+    )
+    env = MazeEnv(
+        MazeConfig(
+            max_player_speed=1,
+            monster_speed=0,
+            monster_activation_delay=999,
+            max_episode_steps=100,
+            stall_threshold=50,
+        ),
+        training_mode=False,
+    )
+    env.reset(options={"layout": layout, "maze_seed": 654})
+
+    final_info = None
+    terminated = False
+    truncated = False
+    for action in (1, 3) * 8:
+        _, _, terminated, truncated, info = env.step(action)
+        final_info = info
+        if terminated or truncated:
+            break
+
+    assert final_info is not None
+    assert terminated is False
+    assert truncated is True
+    assert final_info["outcome"] == "stall"
+    assert final_info["repeat_loop_detected"] is True
+    assert final_info["repeat_loop_stalled"] is True
+    assert final_info["episode_metrics"].stalled is True
+
+
 def test_visibility_memory_reveals_only_seen_cells_and_blocks_through_walls() -> None:
     """The agent should remember seen cells, hide unknown cells, and not see through walls."""
 
@@ -368,6 +439,107 @@ def test_last_seen_monster_position_persists_after_rounding_corner() -> None:
     assert after["monster_visible"] is False
     assert after["last_seen_monster_position"] == (1, 4)
     assert after["turns_since_monster_seen"] == 1
+
+
+def test_player_survives_perpendicular_monster_at_t_intersection() -> None:
+    """A monster rounding through a T intersection should not cause an unavoidable surprise loss."""
+
+    layout = MazeLayout(
+        grid=(
+            "#######",
+            "#######",
+            "#######",
+            "##...##",
+            "###.###",
+            "###.###",
+            "#######",
+        ),
+        player_start=Position(4, 3),
+        monster_start=Position(3, 4),
+        exit_position=Position(5, 3),
+        seed=658,
+    )
+    env = MazeEnv(
+        MazeConfig(max_player_speed=1, monster_speed=1, monster_activation_delay=0),
+        training_mode=False,
+    )
+    env.reset(options={"layout": layout, "maze_seed": 658})
+
+    _observation, _reward, terminated, truncated, info = env.step(0)
+    masks = env.action_masks()
+
+    assert terminated is False
+    assert truncated is False
+    assert info["outcome"] == "running"
+    assert info["state_snapshot"]["player_position"] == (3, 3)
+    assert info["state_snapshot"]["monster_position"] == (3, 2)
+    assert info["state_snapshot"]["monster_visible"] is True
+    assert masks[3] is False
+    assert any(masks[index] for index in (1, 2))
+
+
+def test_head_on_corridor_collision_triggers_reactive_dodge() -> None:
+    """In a corridor the player dodges back and never swaps through the monster."""
+
+    layout = MazeLayout(
+        grid=(
+            "#######",
+            "#....##",
+            "#######",
+        ),
+        player_start=Position(1, 2),
+        monster_start=Position(1, 4),
+        exit_position=Position(1, 1),
+        seed=659,
+    )
+    env = MazeEnv(
+        MazeConfig(max_player_speed=1, monster_speed=1, monster_activation_delay=0),
+        training_mode=False,
+    )
+    env.reset(options={"layout": layout, "maze_seed": 659})
+
+    _observation, _reward, terminated, truncated, info = env.step(1)
+
+    # Reactive dodge: player escapes, not caught
+    assert terminated is False
+    assert truncated is False
+    assert info["outcome"] == "running"
+    assert env.player == Position(1, 2)
+    assert env.monster == Position(1, 3)
+
+
+def test_trapped_in_dead_end_still_caught() -> None:
+    """Player is caught when monster blocks the only exit from a dead-end spur."""
+
+    layout = MazeLayout(
+        grid=(
+            "#####",
+            "#.###",
+            "#.###",
+            "#.###",
+            "#####",
+        ),
+        player_start=Position(3, 1),
+        monster_start=Position(1, 1),
+        exit_position=Position(1, 1),
+        seed=700,
+    )
+    env = MazeEnv(
+        MazeConfig(max_player_speed=1, monster_speed=2, monster_activation_delay=0),
+        training_mode=False,
+    )
+    env.reset(options={"layout": layout, "maze_seed": 700})
+
+    # Player moves north, monster is faster and catches up
+    _obs, _rew, terminated, truncated, _info = env.step(0)  # north
+    if not terminated:
+        _obs, _rew, terminated, truncated, _info = env.step(0)  # north again
+    # Eventually the player runs out of room in the corridor
+    for _ in range(10):
+        if terminated or truncated:
+            break
+        _obs, _rew, terminated, truncated, _info = env.step(0)
+    assert terminated is True
 
 
 def test_visibility_reaches_one_tile_farther_for_monster_sight() -> None:
@@ -476,7 +648,109 @@ def test_known_dead_end_path_marks_visible_leaf_corridor() -> None:
     assert {(2, 3), (2, 4)}.issubset(
         set(snapshot["known_dead_end_cells"])
     )
-    assert (2, 2) not in set(snapshot["known_dead_end_cells"])
+
+
+def test_known_dead_end_path_marks_branch_route_when_all_forward_branches_die() -> None:
+    """A remembered corridor into a branching dead region should be treated as a dead route."""
+
+    layout = MazeLayout(
+        grid=(
+            "#########",
+            "#...#####",
+            "###.#####",
+            "##...####",
+            "#########",
+        ),
+        player_start=Position(1, 3),
+        monster_start=Position(1, 2),
+        exit_position=Position(1, 1),
+        seed=706,
+    )
+    env = MazeEnv(
+        MazeConfig(
+            vision_range=4,
+            max_player_speed=1,
+            monster_speed=0,
+            monster_activation_delay=999,
+        ),
+        training_mode=False,
+    )
+    env.reset(options={"layout": layout, "maze_seed": 706})
+    env.seen_open_cells = {
+        Position(1, 1),
+        Position(1, 2),
+        Position(1, 3),
+        Position(2, 3),
+        Position(3, 2),
+        Position(3, 3),
+        Position(3, 4),
+    }
+    env.discovered_cells = len(env.seen_open_cells)
+    env._refresh_known_dead_end_paths()
+
+    snapshot = env.get_state_snapshot()
+    dead_end_cells = set(snapshot["known_dead_end_cells"])
+    summaries = env.get_visible_direction_summaries()
+
+    assert {(2, 3), (3, 2), (3, 3), (3, 4)}.issubset(dead_end_cells)
+    assert summaries[2].enters_visible_dead_end is True
+    assert summaries[3].exit_visible is True
+
+
+def test_known_dead_end_branch_region_stays_marked_after_player_walks_away() -> None:
+    """Mapped branchy dead regions should stay known even when no longer in view."""
+
+    layout = MazeLayout(
+        grid=(
+            "###########",
+            "#...#######",
+            "###.#######",
+            "#........##",
+            "###.#######",
+            "##...######",
+            "###########",
+        ),
+        player_start=Position(3, 8),
+        monster_start=Position(3, 1),
+        exit_position=Position(3, 7),
+        seed=711,
+    )
+    env = MazeEnv(
+        MazeConfig(
+            vision_range=2,
+            max_player_speed=1,
+            monster_speed=0,
+            monster_activation_delay=999,
+        ),
+        training_mode=False,
+    )
+    env.reset(options={"layout": layout, "maze_seed": 711})
+    env.seen_open_cells = {
+        Position(1, 1),
+        Position(1, 2),
+        Position(1, 3),
+        Position(2, 3),
+        Position(3, 1),
+        Position(3, 2),
+        Position(3, 3),
+        Position(3, 4),
+        Position(3, 5),
+        Position(3, 6),
+        Position(3, 7),
+        Position(3, 8),
+        Position(4, 3),
+        Position(5, 2),
+        Position(5, 3),
+        Position(5, 4),
+    }
+    env.discovered_cells = len(env.seen_open_cells)
+    env._refresh_known_dead_end_paths()
+
+    dead_end_cells = set(env.get_state_snapshot()["known_dead_end_cells"])
+
+    assert {(3, 3), (2, 3), (1, 3), (1, 2), (1, 1), (4, 3), (5, 2), (5, 3), (5, 4)}.issubset(
+        dead_end_cells
+    )
 
 
 def test_wait_step_advances_turn_without_moving_player() -> None:

@@ -21,6 +21,20 @@ from .rewards import StepEvent, compute_reward
 
 
 DIRECTION_DELTAS = [(-1, 0), (0, 1), (1, 0), (0, -1)]
+REPEAT_LOOP_TERMINATION_STREAK = 12
+
+# Game score constants (integer points displayed alongside rewards)
+SCORE_NEW_CELL = 10
+SCORE_FRONTIER = 5
+SCORE_SURVIVAL = 1
+SCORE_REVISIT = -2
+SCORE_OSCILLATION = -3
+SCORE_DEAD_END = -5
+SCORE_BLOCKED = -2
+SCORE_ESCAPE_BONUS = 200
+SCORE_CAUGHT_PENALTY = -100
+SCORE_TIMEOUT_PENALTY = -50
+SCORE_STALL_PENALTY = -40
 
 
 @dataclass(frozen=True)
@@ -93,6 +107,8 @@ class MazeEnv(gym.Env[np.ndarray, int]):
         self._last_avoidable_capture_reason: str | None = None
         self.last_action_index: int | None = None
         self.path_history: deque[Position] = deque(maxlen=6)
+        self._scheduled_focus_seed: int | None = None
+        self._game_score = 0
 
     def reset(
         self,
@@ -105,11 +121,21 @@ class MazeEnv(gym.Env[np.ndarray, int]):
         fixed_layout = options.get("layout")
         maze_seed = options.get("maze_seed")
         if maze_seed is None:
-            maze_seed = (
-                seed
-                if seed is not None
-                else int(self.np_random.integers(0, np.iinfo(np.int64).max))
-            )
+            if self.config.fixed_maze_seed is not None:
+                if self._scheduled_focus_seed is None:
+                    self._scheduled_focus_seed = int(self.config.fixed_maze_seed)
+                maze_seed = self._scheduled_focus_seed
+                jump_max = max(1, int(self.config.focused_seed_jump_max))
+                jump = int(self.np_random.integers(1, jump_max + 1))
+                self._scheduled_focus_seed += jump
+            else:
+                maze_seed = (
+                    seed
+                    if seed is not None
+                    else int(self.np_random.integers(0, np.iinfo(np.int64).max))
+                )
+        elif self.config.fixed_maze_seed is not None:
+            self._scheduled_focus_seed = int(maze_seed)
         self._latest_seed = int(maze_seed)
         self._active_stage = self._resolve_curriculum_stage(self._episode_index)
         self.layout = (
@@ -120,6 +146,11 @@ class MazeEnv(gym.Env[np.ndarray, int]):
                 self._active_rows,
                 self._active_cols,
                 vision_range=self.config.vision_range,
+                max_player_speed=self.config.max_player_speed,
+                monster_speed=self._active_monster_speed,
+                monster_activation_delay=self._active_monster_activation_delay,
+                monster_move_interval=self._active_monster_move_interval,
+                max_episode_steps=self._active_max_episode_steps,
             )
         )
         self._active_rows = self.layout.rows
@@ -162,6 +193,7 @@ class MazeEnv(gym.Env[np.ndarray, int]):
         self.last_capture_rule = None
         self._last_avoidable_capture = False
         self._last_avoidable_capture_reason = None
+        self._game_score = 0
         self._episode_index += 1
         observation = self._get_observation()
         return observation, {
@@ -257,55 +289,57 @@ class MazeEnv(gym.Env[np.ndarray, int]):
                 )
             )
 
-        for substep in range(max(1, player_speed, self._active_monster_speed)):
-            if (
-                direction_index is not None
-                and player_can_continue
-                and substep < player_speed
-                and not terminated
-                and not truncated
-            ):
-                moved, revisited, entered_dead_end, visit_depth = self._move_player(direction_index)
-                if moved:
-                    player_path.append(self.player)
-                    micro_steps.append(
-                        ReplayMicroStep(
-                            actor="player",
-                            index=len(player_path),
-                            position=self.player.as_tuple(),
-                            phase=f"player-{substep + 1}",
-                        )
+        # Phase 1: Human moves first – complete all player substeps before the monster acts
+        for substep in range(player_speed if direction_index is not None else 0):
+            if not player_can_continue or terminated or truncated:
+                break
+            moved, revisited, entered_dead_end, visit_depth = self._move_player(direction_index)
+            if moved:
+                player_path.append(self.player)
+                micro_steps.append(
+                    ReplayMicroStep(
+                        actor="player",
+                        index=len(player_path),
+                        position=self.player.as_tuple(),
+                        phase=f"player-{substep + 1}",
                     )
-                if moved and self.player not in self.unique_visited:
-                    self.unique_visited.add(self.player)
-                    new_cells += 1
-                if revisited:
-                    revisits += 1
-                    self.revisits += 1
-                    revisit_depth = max(revisit_depth, visit_depth)
-                if entered_dead_end:
-                    dead_end_entries += 1
-                    self.dead_end_entries += 1
-                if not moved:
-                    blocked_moves += 1
-                    self.blocked_moves += 1
-                    player_can_continue = False
-                if self.player == self.monster:
-                    terminated = True
-                    reason = "caught"
-                    self.last_capture_rule = "same-cell"
-                    capture_event = self._build_capture_event("player", substep + 1)
-                if self.player == self.layout.exit_position:
-                    terminated = True
-                    reason = "escaped"
+                )
+            if moved and self.player not in self.unique_visited:
+                self.unique_visited.add(self.player)
+                new_cells += 1
+            if revisited:
+                revisits += 1
+                self.revisits += 1
+                revisit_depth = max(revisit_depth, visit_depth)
+            if entered_dead_end:
+                dead_end_entries += 1
+                self.dead_end_entries += 1
+            if not moved:
+                blocked_moves += 1
+                self.blocked_moves += 1
+                player_can_continue = False
+            if self.player == self.monster:
+                terminated = True
+                reason = "caught"
+                self.last_capture_rule = "same-cell"
+                capture_event = self._build_capture_event("player", substep + 1)
+            if self.player == self.layout.exit_position:
+                terminated = True
+                reason = "escaped"
 
-            if (
-                substep < self._active_monster_speed
-                and self._monster_is_active()
-                and not terminated
-                and not truncated
-            ):
+        # Phase 2: Monster acts after the human has finished moving
+        if self._monster_is_active():
+            for substep in range(self._active_monster_speed):
+                if terminated or truncated:
+                    break
+                monster_previous_position = self.monster
                 moved = self._move_monster()
+                monster_passed_through_intersection = False
+                if moved and self.player == self.monster:
+                    monster_passed_through_intersection = self._apply_intersection_escape_window(
+                        player_start,
+                        monster_previous_position,
+                    )
                 if moved:
                     monster_path.append(self.monster)
                     micro_steps.append(
@@ -313,23 +347,53 @@ class MazeEnv(gym.Env[np.ndarray, int]):
                             actor="monster",
                             index=len(monster_path),
                             position=self.monster.as_tuple(),
-                            phase=f"monster-{substep + 1}",
+                            phase=(
+                                f"monster-{substep + 1}-pass"
+                                if monster_passed_through_intersection
+                                else f"monster-{substep + 1}"
+                            ),
                         )
                     )
                 if self.player == self.monster:
-                    terminated = True
-                    reason = "caught"
-                    self.last_capture_rule = "same-cell"
-                    if micro_steps:
-                        last_step = micro_steps[-1]
-                        micro_steps[-1] = ReplayMicroStep(
-                            actor=last_step.actor,
-                            index=last_step.index,
-                            position=last_step.position,
-                            phase=last_step.phase,
-                            capture=True,
+                    dodge_target = self._reactive_dodge(monster_previous_position)
+                    if dodge_target is not None:
+                        self.player = dodge_target
+                        self.path_history.append(self.player)
+                        prev_visits = self.visited_counts.get(self.player, 0)
+                        self.visited_counts[self.player] = prev_visits + 1
+                        player_path.append(self.player)
+                        micro_steps.append(
+                            ReplayMicroStep(
+                                actor="player",
+                                index=len(player_path),
+                                position=self.player.as_tuple(),
+                                phase=f"player-dodge-{substep + 1}",
+                            )
                         )
-                    capture_event = self._build_capture_event("monster", substep + 1)
+                        if self.player not in self.unique_visited:
+                            self.unique_visited.add(self.player)
+                            new_cells += 1
+                        elif prev_visits > 0:
+                            revisits += 1
+                            self.revisits += 1
+                        if self.player == self.layout.exit_position:
+                            terminated = True
+                            reason = "escaped"
+                        break  # monster loses remaining substeps after dodge
+                    else:
+                        terminated = True
+                        reason = "caught"
+                        self.last_capture_rule = "same-cell"
+                        if micro_steps:
+                            last_step = micro_steps[-1]
+                            micro_steps[-1] = ReplayMicroStep(
+                                actor=last_step.actor,
+                                index=last_step.index,
+                                position=last_step.position,
+                                phase=last_step.phase,
+                                capture=True,
+                            )
+                        capture_event = self._build_capture_event("monster", substep + 1)
 
         self.step_count += 1
         oscillation_severity = self._oscillation_severity()
@@ -359,6 +423,19 @@ class MazeEnv(gym.Env[np.ndarray, int]):
         self.peak_no_progress_steps = max(self.peak_no_progress_steps, self.no_progress_steps)
 
         repeat_loop_detected = self.repeat_move_streak >= 5 and new_cells == 0 and frontier_cells == 0
+        repeat_loop_stalled = (
+            self.repeat_move_streak >= REPEAT_LOOP_TERMINATION_STREAK
+            and new_cells == 0
+            and frontier_cells == 0
+        )
+
+        if not terminated:
+            if repeat_loop_stalled or self.no_progress_steps >= self._active_stall_threshold:
+                truncated = True
+                reason = "stall"
+            elif self.step_count >= self._active_max_episode_steps:
+                truncated = True
+                reason = "timeout"
 
         exit_progress_delta = float(previous_exit_distance - self._distance(self.player, self.layout.exit_position))
         monster_distance_delta = float(self._distance(self.player, self.monster) - previous_monster_distance)
@@ -383,6 +460,27 @@ class MazeEnv(gym.Env[np.ndarray, int]):
             ),
         )
         self.total_reward += reward.total
+
+        # Accumulate visible game score
+        step_score = (
+            SCORE_NEW_CELL * new_cells
+            + SCORE_FRONTIER * frontier_cells
+            + SCORE_SURVIVAL
+            + SCORE_REVISIT * revisits
+            + SCORE_OSCILLATION * oscillation_severity
+            + SCORE_DEAD_END * dead_end_entries
+            + SCORE_BLOCKED * blocked_moves
+        )
+        if reason == "escaped":
+            step_score += SCORE_ESCAPE_BONUS
+        elif reason == "caught":
+            step_score += SCORE_CAUGHT_PENALTY
+        elif reason == "timeout":
+            step_score += SCORE_TIMEOUT_PENALTY
+        elif reason == "stall":
+            step_score += SCORE_STALL_PENALTY
+        self._game_score += step_score
+
         self.last_action_direction = direction_index
         self.last_action_speed = player_speed
         self.last_outcome = reason
@@ -423,6 +521,7 @@ class MazeEnv(gym.Env[np.ndarray, int]):
             "repeat_move_streak": self.repeat_move_streak,
             "peak_repeat_move_streak": self.peak_repeat_move_streak,
             "repeat_loop_detected": repeat_loop_detected,
+            "repeat_loop_stalled": repeat_loop_stalled,
             "escape_move_available": step_escape_move_available,
             "best_escape_action": step_best_escape_action,
             "avoidable_capture": step_avoidable_capture,
@@ -594,6 +693,7 @@ class MazeEnv(gym.Env[np.ndarray, int]):
             "monster_enabled": self._active_monster_speed > 0 and self._active_monster_activation_delay <= self._active_max_episode_steps,
             "wait_supported": True,
             "action_count": int(self.action_space.n),
+            "game_score": self._game_score,
         }
 
     def _get_observation(self) -> np.ndarray:
@@ -642,6 +742,89 @@ class MazeEnv(gym.Env[np.ndarray, int]):
             self.monster = path[1]
             return True
         return False
+
+    def _apply_intersection_escape_window(
+        self,
+        player_previous_position: Position,
+        monster_previous_position: Position,
+    ) -> bool:
+        """Let the monster pass through a junction instead of causing a surprise corner capture."""
+
+        current_position = self.player
+        if current_position is None or self.monster is None or self.layout is None:
+            return False
+        if player_previous_position == current_position:
+            return False
+
+        player_delta = (
+            current_position.row - player_previous_position.row,
+            current_position.col - player_previous_position.col,
+        )
+        monster_delta = (
+            current_position.row - monster_previous_position.row,
+            current_position.col - monster_previous_position.col,
+        )
+        if player_delta == monster_delta:
+            return False
+        if player_delta == (-monster_delta[0], -monster_delta[1]):
+            return False
+        if player_delta[0] * monster_delta[0] + player_delta[1] * monster_delta[1] != 0:
+            return False
+
+        exits = [
+            neighbor
+            for delta_row, delta_col in DIRECTION_DELTAS
+            if not self._is_wall(neighbor := current_position.shifted(delta_row, delta_col))
+        ]
+        if len(exits) < 3:
+            return False
+
+        pass_through_position = current_position.shifted(monster_delta[0], monster_delta[1])
+        if self._is_wall(pass_through_position):
+            return False
+        if pass_through_position == player_previous_position:
+            return False
+
+        alternative_escapes = [
+            position
+            for position in exits
+            if position != pass_through_position and position != monster_previous_position
+        ]
+        if not alternative_escapes:
+            return False
+
+        self.monster = pass_through_position
+        return True
+
+    def _reactive_dodge(self, monster_previous_position: Position) -> Position | None:
+        """When the monster lands on the player, pick the best adjacent escape cell.
+
+        Returns the dodge target position, or ``None`` if the player is truly
+        trapped (no open adjacent cell).  The caller is responsible for moving
+        the player and recording micro-steps.
+        """
+        if self.player is None or self.layout is None or self.monster is None:
+            return None
+
+        candidates: list[Position] = []
+        for dr, dc in DIRECTION_DELTAS:
+            nb = self.player.shifted(dr, dc)
+            if not self._is_wall(nb) and nb != monster_previous_position:
+                candidates.append(nb)
+
+        if not candidates:
+            return None
+
+        exit_pos = self.layout.exit_position
+
+        def _rank(target: Position) -> tuple[bool, int, int]:
+            is_known_dead = self.is_known_dead_route_target(target)
+            visits = self.visited_counts.get(target, 0)
+            exit_dist = self._distance(target, exit_pos)
+            return (is_known_dead, exit_dist, visits)
+
+        candidates.sort(key=_rank)
+        return candidates[0]
 
     def _observe_from_player(self) -> int:
         """Reveal visible cells from the player and return newly seen open-cell count."""
@@ -743,11 +926,39 @@ class MazeEnv(gym.Env[np.ndarray, int]):
                 ):
                     queue.append(neighbor)
 
-        dead_end_cells.update(self._visible_dead_end_path_cells())
+        dead_end_cells.update(self._all_known_dead_route_cells())
         self.known_dead_end_cells = dead_end_cells
 
+    def _all_known_dead_route_cells(self) -> set[Position]:
+        """Return all remembered routes that only lead into fully known dead branches."""
+
+        if self.layout is None:
+            return set()
+
+        known_cells: set[Position] = set()
+        memo: dict[tuple[Position, Position], set[Position] | None] = {}
+        for parent in self.seen_open_cells:
+            for delta_row, delta_col in DIRECTION_DELTAS:
+                child = parent.shifted(delta_row, delta_col)
+                if child not in self.seen_open_cells or self._is_wall(child):
+                    continue
+                route = self._dead_route_from(child, parent, memo, set())
+                if route is not None:
+                    known_cells.update(route)
+        return known_cells
+
+    def is_known_dead_route_target(self, target: Position, parent: Position | None = None) -> bool:
+        """Return whether moving from parent into target commits to a known dead route."""
+
+        if self.layout is None:
+            return False
+        route_parent = self.player if parent is None else parent
+        if route_parent is None or target not in self.seen_open_cells:
+            return False
+        return bool(self._known_dead_route_cells(target, route_parent))
+
     def _visible_dead_end_path_cells(self) -> set[Position]:
-        """Return currently visible straight corridors that are known to terminate in dead ends."""
+        """Return remembered forward routes that are known to terminate in dead ends."""
 
         if self.player is None or self.layout is None:
             return set()
@@ -758,14 +969,66 @@ class MazeEnv(gym.Env[np.ndarray, int]):
                 continue
             delta_row, delta_col = DIRECTION_DELTAS[summary.direction]
             current = self.player.shifted(delta_row, delta_col)
-            while current in self.visible_open_cells:
-                known_cells.add(current)
-                if self._is_dead_end(current):
-                    break
-                if self._has_side_branch(current, summary.direction):
-                    break
-                current = current.shifted(delta_row, delta_col)
+            known_cells.update(self._known_dead_route_cells(current, self.player))
         return known_cells
+
+    def _known_dead_route_cells(self, start: Position, parent: Position) -> set[Position]:
+        """Return cells in a remembered route that can only end in known dead branches."""
+
+        if self.layout is None or start not in self.seen_open_cells:
+            return set()
+
+        memo: dict[tuple[Position, Position], set[Position] | None] = {}
+        route = self._dead_route_from(start, parent, memo, set())
+        return set() if route is None else route
+
+    def _dead_route_from(
+        self,
+        position: Position,
+        parent: Position,
+        memo: dict[tuple[Position, Position], set[Position] | None],
+        active: set[tuple[Position, Position]],
+    ) -> set[Position] | None:
+        """Return the remembered subtree when every forward continuation is a dead route."""
+
+        if self.layout is None:
+            return None
+        if position == self.layout.exit_position:
+            return None
+
+        key = (position, parent)
+        if key in memo:
+            return memo[key]
+        if key in active:
+            memo[key] = None
+            return None
+
+        active.add(key)
+        children: list[Position] = []
+        for delta_row, delta_col in DIRECTION_DELTAS:
+            candidate = position.shifted(delta_row, delta_col)
+            if candidate == parent or self._is_wall(candidate):
+                continue
+            if candidate not in self.seen_open_cells:
+                active.remove(key)
+                memo[key] = None
+                return None
+            children.append(candidate)
+
+        if not children:
+            result: set[Position] | None = {position}
+        else:
+            result = {position}
+            for child in children:
+                child_route = self._dead_route_from(child, position, memo, active)
+                if child_route is None:
+                    result = None
+                    break
+                result.update(child_route)
+
+        active.remove(key)
+        memo[key] = result
+        return result
 
     def _shortest_path(self, start: Position, goal: Position) -> list[Position]:
         queue: deque[Position] = deque([start])
@@ -826,6 +1089,8 @@ class MazeEnv(gym.Env[np.ndarray, int]):
                 enters_visible_dead_end=False,
             )
 
+        remembered_dead_route = bool(self._known_dead_route_cells(candidate, self.player))
+
         visible_depth = 0
         current = candidate
         while current in self.visible_open_cells:
@@ -855,7 +1120,7 @@ class MazeEnv(gym.Env[np.ndarray, int]):
             legal=True,
             visible_depth=visible_depth,
             exit_visible=False,
-            enters_visible_dead_end=False,
+            enters_visible_dead_end=remembered_dead_route,
         )
 
     def _has_side_branch(self, position: Position, direction_index: int) -> bool:

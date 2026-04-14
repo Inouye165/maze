@@ -157,7 +157,7 @@ def describe_move_choice(env: MazeEnv, action: int) -> HeuristicMoveChoice | Non
         immediate_reverse=previous_position is not None and first_step_target == previous_position,
         short_loop_risk=_short_loop_risk(env, target),
         enters_dead_end=_is_dead_end_target(env, target),
-        known_dead_end=target in env.known_dead_end_cells,
+        known_dead_end=env.is_known_dead_route_target(target),
         wait_action=False,
     )
 

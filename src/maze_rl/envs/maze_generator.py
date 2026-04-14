@@ -8,6 +8,9 @@ from random import Random
 from .entities import MazeLayout, Position
 
 
+DIRECTION_DELTAS = [(-1, 0), (0, 1), (1, 0), (0, -1)]
+
+
 def _ensure_odd(value: int) -> int:
     return value if value % 2 == 1 else value + 1
 
@@ -70,7 +73,7 @@ def _bfs_distances(grid: tuple[str, ...], start: Position) -> dict[Position, int
     queue: deque[Position] = deque([start])
     while queue:
         current = queue.popleft()
-        for delta_row, delta_col in ((-1, 0), (0, 1), (1, 0), (0, -1)):
+        for delta_row, delta_col in DIRECTION_DELTAS:
             candidate = current.shifted(delta_row, delta_col)
             if not _in_bounds(candidate.row, candidate.col, len(grid), len(grid[0])):
                 continue
@@ -94,7 +97,7 @@ def _shortest_path(
         current = queue.popleft()
         if current == goal:
             break
-        for delta_row, delta_col in ((-1, 0), (0, 1), (1, 0), (0, -1)):
+        for delta_row, delta_col in DIRECTION_DELTAS:
             candidate = current.shifted(delta_row, delta_col)
             if not _in_bounds(candidate.row, candidate.col, len(grid), len(grid[0])):
                 continue
@@ -142,12 +145,166 @@ def _has_line_of_sight(
     return False
 
 
+def _move_player(
+    grid: tuple[str, ...],
+    player: Position,
+    direction: tuple[int, int],
+) -> tuple[Position, bool]:
+    candidate = player.shifted(direction[0], direction[1])
+    if not _in_bounds(candidate.row, candidate.col, len(grid), len(grid[0])):
+        return player, False
+    if grid[candidate.row][candidate.col] == "#":
+        return player, False
+    return candidate, True
+
+
+def _monster_is_active(turn_index: int, monster_activation_delay: int, monster_move_interval: int) -> bool:
+    if turn_index < monster_activation_delay:
+        return False
+    if monster_move_interval > 1 and turn_index % monster_move_interval != 0:
+        return False
+    return True
+
+
+def _turn_phase(
+    turn_index: int,
+    monster_activation_delay: int,
+    monster_move_interval: int,
+) -> tuple[int, int]:
+    if turn_index < monster_activation_delay:
+        return (0, turn_index)
+    return (1, turn_index % max(1, monster_move_interval))
+
+
+def _simulate_turn(
+    grid: tuple[str, ...],
+    player: Position,
+    monster: Position,
+    exit_position: Position,
+    direction_index: int,
+    speed: int,
+    turn_index: int,
+    monster_speed: int,
+    monster_activation_delay: int,
+    monster_move_interval: int,
+) -> tuple[Position, Position, str]:
+    player_current = player
+    monster_current = monster
+    player_can_continue = True
+
+    for substep in range(max(1, speed, monster_speed)):
+        if player_can_continue and substep < speed:
+            player_current, moved = _move_player(
+                grid,
+                player_current,
+                DIRECTION_DELTAS[direction_index],
+            )
+            if not moved:
+                player_can_continue = False
+            if player_current == monster_current:
+                return player_current, monster_current, "caught"
+            if player_current == exit_position:
+                return player_current, monster_current, "escaped"
+
+        if substep < monster_speed and _monster_is_active(turn_index, monster_activation_delay, monster_move_interval):
+            path = _shortest_path(grid, monster_current, player_current)
+            if len(path) >= 2:
+                monster_current = path[1]
+            if player_current == monster_current:
+                return player_current, monster_current, "caught"
+
+    return player_current, monster_current, "running"
+
+
+def _path_segment(
+    path: list[Position],
+    start_index: int,
+    max_player_speed: int,
+) -> tuple[int, int, int]:
+    current = path[start_index]
+    next_position = path[start_index + 1]
+    direction = (next_position.row - current.row, next_position.col - current.col)
+    direction_index = DIRECTION_DELTAS.index(direction)
+    end_index = start_index + 1
+    while end_index < len(path) - 1 and end_index - start_index < max_player_speed:
+        candidate = path[end_index + 1]
+        candidate_direction = (
+            candidate.row - path[end_index].row,
+            candidate.col - path[end_index].col,
+        )
+        if candidate_direction != direction:
+            break
+        end_index += 1
+    speed = end_index - start_index
+    return direction_index, speed, end_index
+
+
+def _layout_is_winnable(
+    grid: tuple[str, ...],
+    player_start: Position,
+    monster_start: Position,
+    exit_position: Position,
+    *,
+    max_player_speed: int = 1,
+    monster_speed: int = 1,
+    monster_activation_delay: int = 0,
+    monster_move_interval: int = 1,
+    max_episode_steps: int = 120,
+) -> bool:
+    path_to_exit = _shortest_path(grid, player_start, exit_position)
+    if not path_to_exit or path_to_exit[-1] != exit_position:
+        return False
+
+    player = player_start
+    monster = monster_start
+    turn_index = 0
+    path_index = 0
+
+    while path_index < len(path_to_exit) - 1:
+        if turn_index >= max_episode_steps:
+            return False
+        direction_index, speed, next_index = _path_segment(
+            path_to_exit,
+            path_index,
+            max_player_speed,
+        )
+        player, monster, outcome = _simulate_turn(
+            grid,
+            player,
+            monster,
+            exit_position,
+            direction_index,
+            speed,
+            turn_index,
+            monster_speed,
+            monster_activation_delay,
+            monster_move_interval,
+        )
+        if outcome == "escaped":
+            return True
+        if outcome == "caught":
+            return False
+        path_index = next_index
+        turn_index += 1
+
+    return player == exit_position
+
+
 def _choose_exit_and_monster(
     grid: tuple[str, ...],
     start: Position,
     vision_range: int,
+    *,
+    max_player_speed: int = 1,
+    monster_speed: int = 1,
+    monster_activation_delay: int = 0,
+    monster_move_interval: int = 1,
+    max_episode_steps: int = 120,
 ) -> tuple[Position, Position]:
     """Choose an exit and monster pair that guarantees at least one sighting."""
+
+    max_exit_candidates = 24
+    max_monster_candidates = 24
 
     distances_from_start = _bfs_distances(grid, start)
     max_dist = max(distances_from_start.values())
@@ -158,7 +315,7 @@ def _choose_exit_and_monster(
             abs(distances_from_start[position] - target_dist),
             -distances_from_start[position],
         ),
-    )
+    )[:max_exit_candidates]
     open_positions = [position for position in distances_from_start if position != start]
 
     for exit_position in exit_candidates:
@@ -172,8 +329,8 @@ def _choose_exit_and_monster(
                 for path_position in path_to_exit
             )
         ]
-        if not visible_monsters:
-            continue
+        fallback_monsters = [position for position in open_positions if position != exit_position]
+
         def _score_visible_monster(position: Position) -> tuple[int, int]:
             return (
                 distances_from_start.get(position, 0),
@@ -181,11 +338,32 @@ def _choose_exit_and_monster(
                 + abs(position.col - exit_position.col),
             )
 
-        monster_start = max(
-            visible_monsters,
-            key=_score_visible_monster,
-        )
-        return exit_position, monster_start
+        candidate_groups = [
+            sorted(
+                visible_monsters,
+                key=_score_visible_monster,
+                reverse=True,
+            )[:max_monster_candidates],
+            sorted(
+                fallback_monsters,
+                key=_score_visible_monster,
+                reverse=True,
+            )[:max_monster_candidates],
+        ]
+        for candidates in candidate_groups:
+            for monster_start in candidates:
+                if _layout_is_winnable(
+                    grid,
+                    start,
+                    monster_start,
+                    exit_position,
+                    max_player_speed=max_player_speed,
+                    monster_speed=monster_speed,
+                    monster_activation_delay=monster_activation_delay,
+                    monster_move_interval=monster_move_interval,
+                    max_episode_steps=max_episode_steps,
+                ):
+                    return exit_position, monster_start
 
     fallback_exit = exit_candidates[0]
     def _score_fallback_monster(position: Position) -> tuple[int, int]:
@@ -194,12 +372,25 @@ def _choose_exit_and_monster(
             abs(position.row - fallback_exit.row)
             + abs(position.col - fallback_exit.col),
         )
-
-    fallback_monster = max(
+    fallback_monsters = sorted(
         (position for position in open_positions if position != fallback_exit),
         key=_score_fallback_monster,
-    )
-    return fallback_exit, fallback_monster
+        reverse=True,
+    )[:max_monster_candidates]
+    for fallback_monster in fallback_monsters:
+        if _layout_is_winnable(
+            grid,
+            start,
+            fallback_monster,
+            fallback_exit,
+            max_player_speed=max_player_speed,
+            monster_speed=monster_speed,
+            monster_activation_delay=monster_activation_delay,
+            monster_move_interval=monster_move_interval,
+            max_episode_steps=max_episode_steps,
+        ):
+            return fallback_exit, fallback_monster
+    raise ValueError("Unable to generate a winnable maze layout for the requested rules")
 
 
 def generate_maze(
@@ -207,48 +398,65 @@ def generate_maze(
     rows: int,
     cols: int,
     vision_range: int = 4,
+    max_player_speed: int = 1,
+    monster_speed: int = 1,
+    monster_activation_delay: int = 0,
+    monster_move_interval: int = 1,
+    max_episode_steps: int = 120,
 ) -> MazeLayout:
     """Generate a deterministic maze for the given seed."""
 
-    rng = Random(seed)
     rows = max(5, _ensure_odd(rows))
     cols = max(5, _ensure_odd(cols))
-    grid = [["#" for _ in range(cols)] for _ in range(rows)]
     start = Position(1, 1)
-    stack = [start]
-    grid[start.row][start.col] = "."
+    for attempt in range(12):
+        attempt_seed = seed + attempt * 104_729
+        rng = Random(attempt_seed)
+        grid = [["#" for _ in range(cols)] for _ in range(rows)]
+        stack = [start]
+        grid[start.row][start.col] = "."
 
-    while stack:
-        current = stack[-1]
-        options = _neighbors_for_carving(current.row, current.col)
-        rng.shuffle(options)
-        carved = False
-        for next_row, next_col, wall_row, wall_col in options:
-            if not (1 <= next_row < rows - 1 and 1 <= next_col < cols - 1):
-                continue
-            if grid[next_row][next_col] != "#":
-                continue
-            grid[wall_row][wall_col] = "."
-            grid[next_row][next_col] = "."
-            stack.append(Position(next_row, next_col))
-            carved = True
-            break
-        if not carved:
-            stack.pop()
+        while stack:
+            current = stack[-1]
+            options = _neighbors_for_carving(current.row, current.col)
+            rng.shuffle(options)
+            carved = False
+            for next_row, next_col, wall_row, wall_col in options:
+                if not (1 <= next_row < rows - 1 and 1 <= next_col < cols - 1):
+                    continue
+                if grid[next_row][next_col] != "#":
+                    continue
+                grid[wall_row][wall_col] = "."
+                grid[next_row][next_col] = "."
+                stack.append(Position(next_row, next_col))
+                carved = True
+                break
+            if not carved:
+                stack.pop()
 
-    _carve_extra_connections(grid, rng)
+        _carve_extra_connections(grid, rng)
 
-    grid_tuple = tuple("".join(row) for row in grid)
-    exit_position, monster_start = _choose_exit_and_monster(
-        grid_tuple,
-        start,
-        vision_range,
-    )
+        grid_tuple = tuple("".join(row) for row in grid)
+        try:
+            exit_position, monster_start = _choose_exit_and_monster(
+                grid_tuple,
+                start,
+                vision_range,
+                max_player_speed=max_player_speed,
+                monster_speed=monster_speed,
+                monster_activation_delay=monster_activation_delay,
+                monster_move_interval=monster_move_interval,
+                max_episode_steps=max_episode_steps,
+            )
+        except ValueError:
+            continue
 
-    return MazeLayout(
-        grid=grid_tuple,
-        player_start=start,
-        monster_start=monster_start,
-        exit_position=exit_position,
-        seed=seed,
-    )
+        return MazeLayout(
+            grid=grid_tuple,
+            player_start=start,
+            monster_start=monster_start,
+            exit_position=exit_position,
+            seed=seed,
+        )
+
+    raise ValueError("Unable to generate a winnable maze after deterministic retries")

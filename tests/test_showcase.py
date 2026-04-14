@@ -199,6 +199,73 @@ def test_heuristic_runs_away_when_monster_enters_extended_corridor_visibility() 
     assert best.monster_distance_gain > 0
 
 
+def test_heuristic_avoids_reentering_mapped_branchy_dead_region() -> None:
+    """The heuristic should reject an explored dead region even after walking away from it."""
+
+    env = MazeEnv(
+        MazeConfig(
+            rows=7,
+            cols=11,
+            vision_range=2,
+            max_player_speed=1,
+            monster_speed=0,
+            monster_activation_delay=999,
+            curriculum_enabled=False,
+        ),
+        training_mode=False,
+    )
+    layout = MazeLayout(
+        grid=(
+            "###########",
+            "#...#######",
+            "###.#######",
+            "#........##",
+            "###.#######",
+            "##...######",
+            "###########",
+        ),
+        player_start=Position(3, 4),
+        monster_start=Position(3, 1),
+        exit_position=Position(3, 7),
+        seed=97,
+    )
+    env.reset(seed=97, options={"layout": layout, "maze_seed": 97})
+    env.player = Position(3, 4)
+    env.visited_counts = {env.player: 1}
+    env.path_history = deque([env.player], maxlen=6)
+    env.seen_open_cells = {
+        Position(1, 1),
+        Position(1, 2),
+        Position(1, 3),
+        Position(2, 3),
+        Position(3, 1),
+        Position(3, 2),
+        Position(3, 3),
+        Position(3, 4),
+        Position(3, 5),
+        Position(3, 6),
+        Position(3, 7),
+        Position(3, 8),
+        Position(4, 3),
+        Position(5, 2),
+        Position(5, 3),
+        Position(5, 4),
+    }
+    env.discovered_cells = len(env.seen_open_cells)
+    env._observe_from_player()
+    env._refresh_known_dead_end_paths()
+
+    ranked = rank_legal_moves(env)
+    best = ranked[0]
+    west = next(choice for choice in ranked if choice.target == Position(3, 3))
+    east = next(choice for choice in ranked if choice.target == Position(3, 5))
+
+    assert Position(3, 3) in env.known_dead_end_cells
+    assert best.target == Position(3, 5)
+    assert west.known_dead_end is True
+    assert east.known_dead_end is False
+
+
 def test_heuristic_does_not_use_hidden_monster_position_without_memory() -> None:
     """The heuristic should not flee from a monster hidden behind a wall it never saw."""
 

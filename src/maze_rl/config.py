@@ -58,6 +58,8 @@ class MazeConfig:
     max_episode_steps: int = 90
     stall_threshold: int = 14
     train_seed_base: int = 10_000
+    fixed_maze_seed: int | None = None
+    focused_seed_jump_max: int = 1000
     held_out_seed: int = 12_345
     curriculum_enabled: bool = True
     curriculum: tuple[CurriculumStage, ...] = field(

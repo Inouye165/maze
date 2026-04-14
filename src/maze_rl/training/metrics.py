@@ -55,7 +55,7 @@ class EpisodeMetrics:
 class RollingTrainingSummary:
     """Maintain compact aggregate metrics during training."""
 
-    def __init__(self, window_size: int = 50) -> None:
+    def __init__(self, window_size: int = 1000) -> None:
         self.window_size = window_size
         self.total_episodes = 0
         self.total_wins = 0
@@ -83,6 +83,16 @@ class RollingTrainingSummary:
 
         window = list(self.episodes)
         recent_outcomes = [item.outcome for item in window]
+        recent_10_outcomes = recent_outcomes[-10:]
+        recent_50_outcomes = recent_outcomes[-50:]
+        recent_100_outcomes = recent_outcomes[-100:]
+        recent_1000_outcomes = recent_outcomes[-1000:]
+
+        def _win_rate(outcomes: list[str]) -> float:
+            if not outcomes:
+                return 0.0
+            return sum(1 for item in outcomes if item == "escaped") / len(outcomes)
+
         return {
             "episodes_seen": self.total_episodes,
             "wins": self.total_wins,
@@ -128,8 +138,15 @@ class RollingTrainingSummary:
             ),
             "recent_timeout_rate": mean([item.timed_out for item in window]) if window else 0.0,
             "recent_stall_rate": mean([item.stalled for item in window]) if window else 0.0,
-            "recent_avoidable_capture_rate": mean([item.avoidable_capture for item in window]) if window else 0.0,
+            "recent_avoidable_capture_rate": (
+                mean([item.avoidable_capture for item in window]) if window else 0.0
+            ),
             "recent_outcomes": recent_outcomes,
-            "recent_10_outcomes": recent_outcomes[-10:],
-            "recent_50_outcomes": recent_outcomes,
+            "recent_10_outcomes": recent_10_outcomes,
+            "recent_50_outcomes": recent_50_outcomes,
+            "recent_100_outcomes": recent_100_outcomes,
+            "recent_1000_outcomes": recent_1000_outcomes,
+            "recent_10_win_rate": _win_rate(recent_10_outcomes),
+            "recent_100_win_rate": _win_rate(recent_100_outcomes),
+            "recent_1000_win_rate": _win_rate(recent_1000_outcomes),
         }

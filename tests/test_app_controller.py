@@ -1,6 +1,5 @@
 """Control app controller tests."""
 
-import json
 import time
 from pathlib import Path
 
@@ -9,6 +8,7 @@ from maze_rl.envs.maze_env import MazeEnv
 from maze_rl.policies.model_factory import CheckpointCompatibilityError, create_model
 from maze_rl.render.control_app import LabAppController, LabControlApp
 from maze_rl.training.checkpointing import CheckpointManager
+from maze_rl.training.showcase import ShowcaseResult
 from maze_rl.training.train import maze_config_for_training_mode
 
 
@@ -36,7 +36,10 @@ def _create_checkpoints(tmp_path: Path, episodes: tuple[int, ...] = (0,)) -> Pat
 
 
 def test_app_controller_supports_baseline_current_ai_and_replay(tmp_path: Path) -> None:
-    """The controller should support baseline, learned runs, and exact replay without the UI loop."""
+    """The controller should support baseline, learned runs, and exact replay.
+
+    This avoids spinning the full app loop in tests.
+    """
 
     _create_checkpoints(tmp_path, episodes=(0,))
 
@@ -102,6 +105,20 @@ def test_basic_tab_uses_play_label_instead_of_marks_play(tmp_path: Path) -> None
     assert "Marks Play" not in labels
 
 
+def test_control_panel_buttons_stay_within_visible_panel(tmp_path: Path) -> None:
+    """Visible buttons should fit inside the right-side panel for every tab."""
+
+    _create_checkpoints(tmp_path, episodes=(0,))
+
+    app = LabControlApp(checkpoint_dir=tmp_path)
+    allowed_bounds = app.panel_area.inflate(-18, -18)
+
+    for tab_name in ("basic", "review", "advanced"):
+        app.active_tab = tab_name
+        for button in app.build_buttons():
+            assert allowed_bounds.contains(button.rect), (tab_name, button.label, button.rect)
+
+
 def test_play_runs_innate_mode_without_checkpoint(tmp_path: Path) -> None:
     """Play should fall back to innate behavior when no trained checkpoint exists."""
 
@@ -111,7 +128,9 @@ def test_play_runs_innate_mode_without_checkpoint(tmp_path: Path) -> None:
 
     assert controller.session is not None
     assert controller.current_mode == "baseline-legal-mover"
-    assert controller.play_mode_status() == "Mode: Innate"
+    assert controller.seed_text == "00001"
+    assert controller.seed_ladder_active is True
+    assert controller.play_mode_status() == "Policy: Innate"
 
 
 def test_play_runs_trained_mode_when_checkpoint_exists(tmp_path: Path) -> None:
@@ -124,8 +143,119 @@ def test_play_runs_trained_mode_when_checkpoint_exists(tmp_path: Path) -> None:
 
     assert controller.session is not None
     assert controller.current_mode == "current-learned-ai"
-    assert controller.play_mode_status() == "Mode: Trained (ckpt 0000)"
+    assert controller.seed_ladder_active is True
+    assert controller.play_mode_status() == "Policy: Trained (ckpt 0000)"
     assert getattr(controller.session, "allow_policy_override", False) is True
+
+
+def test_play_increments_seed_until_loss_then_trains_failed_seed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Seed ladder play should advance on wins, then arm training after a loss."""
+
+    _create_checkpoints(tmp_path, episodes=(0,))
+    captured_training_calls: list[tuple[int, str, int]] = []
+    outcomes = ["escaped", "caught"]
+
+    def fake_continue_training_from_latest(
+        additional_episodes: int,
+        checkpoint_dir: Path,
+        training_mode: str,
+        stop_event,
+        fixed_maze_seed: int,
+    ) -> None:
+        _ = checkpoint_dir
+        _ = stop_event
+        captured_training_calls.append(
+            (additional_episodes, training_mode, fixed_maze_seed)
+        )
+
+    class FakePlaybackSession:
+        def __init__(
+            self,
+            checkpoint_path,
+            checkpoint_label: str,
+            seed: int,
+            debug_trace: bool,
+            allow_policy_override: bool,
+        ) -> None:
+            _ = checkpoint_path
+            _ = debug_trace
+            self.allow_policy_override = allow_policy_override
+            self.seed = seed
+            self.checkpoint_label = checkpoint_label
+            self.latest_state = {
+                "grid": ("###", "#.#", "###"),
+                "full_grid": ("###", "#.#", "###"),
+                "player_position": (1, 1),
+                "monster_position": (1, 1),
+                "exit_position": (1, 1),
+                "seed": seed,
+            }
+
+        def advance(self):
+            outcome = outcomes.pop(0)
+            result = ShowcaseResult(
+                checkpoint=self.checkpoint_label,
+                status="ok",
+                outcome=outcome,
+                escape_rate=1.0 if outcome == "escaped" else 0.0,
+                coverage=0.5,
+                steps=12,
+                revisits=1,
+                oscillations=0,
+                dead_ends=0,
+                start_monster_distance=4.0,
+                time_to_capture=None,
+                frontier_rate=0.4,
+                peak_no_progress_streak=0,
+                final_player_position=(1, 1),
+                final_monster_position=(1, 1),
+                final_distance=0,
+                capture_rule=None,
+                final_state=dict(self.latest_state),
+                checkpoint_path="fake",
+                seed=self.seed,
+            )
+            return dict(self.latest_state), result
+
+        def build_recorded_run(self):
+            return type("RecordedRunStub", (), {"frames": [dict(self.latest_state)]})()
+
+    monkeypatch.setattr(
+        "maze_rl.render.control_app.continue_training_from_latest",
+        fake_continue_training_from_latest,
+    )
+    monkeypatch.setattr("maze_rl.render.control_app.PlaybackSession", FakePlaybackSession)
+
+    controller = LabAppController(checkpoint_dir=tmp_path)
+    controller.cycle_input_text = "5"
+
+    controller.start_play()
+    controller.update()
+
+    assert controller.seed_text == "00002"
+    assert controller.session is not None
+    assert controller.seed_ladder_active is True
+
+    controller.update()
+
+    assert captured_training_calls == []
+    assert controller.seed_text == "00002"
+    assert controller.last_failed_seed == 2
+    assert controller.seed_ladder_active is False
+    assert controller.pending_training_seed == 2
+
+    controller.cycle_input_text = "7"
+    controller.start_play()
+
+    deadline = time.monotonic() + 0.2
+    while not captured_training_calls and time.monotonic() < deadline:
+        time.sleep(0.005)
+
+    assert captured_training_calls == [(7, "maze-only", 2)]
+    assert controller.pending_training_seed is None
 
 
 def test_app_controller_uses_mode_specific_checkpoint_directories(tmp_path: Path) -> None:
@@ -216,8 +346,14 @@ def test_app_controller_handles_incompatible_checkpoint_without_crashing(
     assert "incompatible" in controller.training_message
 
 
-def test_app_controller_training_controls_use_app_selected_mode(tmp_path: Path, monkeypatch) -> None:
-    """Training controls should use the app-selected training mode and support stop requests."""
+def test_app_controller_training_controls_use_app_selected_mode(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Training controls should use the app-selected training mode.
+
+    Stop requests should still interrupt the background run.
+    """
 
     _create_checkpoints(tmp_path, episodes=(0,))
     calls: list[tuple[int, str]] = []
@@ -299,7 +435,7 @@ def test_training_progress_summary_and_render_state_show_live_training_seed_and_
     render_state = controller.render_state()
     assert render_state is not None
     assert render_state["seed"] == 424242
-    assert render_state["checkpoint_label"] == "training maze-only"
+    assert render_state["checkpoint_label"] == "training seed 424242"
 
 
 def test_maze_learning_mode_simplifies_actions_and_slows_monster() -> None:
@@ -333,31 +469,22 @@ def test_incomplete_checkpoints_are_ignored_by_app(tmp_path: Path) -> None:
     assert controller.latest_training_summary() is None
 
 
-def test_app_controller_builds_last_10_last_50_and_all_time_stats(tmp_path: Path) -> None:
-    """The simplified dashboard should expose training stats for last 10, last 50, and all time."""
-
-    checkpoint_dir = _create_checkpoints(tmp_path, episodes=(0,))
-    metadata_path = checkpoint_dir / "ckpt_0000.json"
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    metadata["training_summary"] = {
-        "episodes_seen": 60,
-        "wins": 36,
-        "recent_outcomes": ["escaped"] * 30 + ["caught"] * 20,
-        "recent_10_outcomes": ["escaped"] * 7 + ["caught"] * 3,
-        "recent_50_outcomes": ["escaped"] * 30 + ["caught"] * 20,
-    }
-    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+def test_app_controller_builds_last_10_last_100_and_last_1000_stats(tmp_path: Path) -> None:
+    """The dashboard should expose app run stats for last 10, last 100, and last 1000 seeds."""
 
     controller = LabAppController(checkpoint_dir=tmp_path)
     controller.cycle_input_text = "12"
+    controller.run_outcomes.extend(["escaped"] * 700 + ["caught"] * 300)
+    controller.total_runs = 1000
+    controller.total_wins = 700
     cards = controller.training_stat_cards()
 
     assert controller.parse_cycle_count() == 12
-    assert [card.label for card in cards] == ["Last 10", "Last 50", "All Time"]
+    assert [card.label for card in cards] == ["Last 10", "Last 100", "Last 1000"]
     assert [(card.cycles, card.wins, card.losses) for card in cards] == [
-        (10, 7, 3),
-        (50, 30, 20),
-        (60, 36, 24),
+        (10, 0, 10),
+        (100, 0, 100),
+        (1000, 700, 300),
     ]
 
 
@@ -393,10 +520,10 @@ def test_reset_training_returns_play_to_innate_mode(tmp_path: Path) -> None:
     _create_checkpoints(tmp_path, episodes=(0, 50))
     controller = LabAppController(checkpoint_dir=tmp_path)
 
-    assert controller.play_mode_status() == "Mode: Trained (ckpt 0050)"
+    assert controller.play_mode_status() == "Policy: Trained (ckpt 0050)"
     controller.reset_training()
     controller.start_play()
 
-    assert controller.play_mode_status() == "Mode: Innate"
+    assert controller.play_mode_status() == "Policy: Innate"
     assert controller.session is not None
     assert controller.current_mode == "baseline-legal-mover"
