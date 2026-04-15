@@ -73,7 +73,11 @@ def run_frozen_episode(
             episode_start=episode_start,
             action_masks=np.asarray(env.action_masks(), dtype=bool),
         )
-        direction, speed = env.decode_action(int(action))
+        is_wait = int(action) == env.wait_action_index
+        if is_wait:
+            direction, speed = None, 0
+        else:
+            direction, speed = env.decode_action(int(action))
         observation, _, terminated, truncated, info = env.step(int(action))
         episode_start = np.array([terminated or truncated], dtype=bool)
         if debug_trace:

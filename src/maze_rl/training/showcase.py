@@ -29,6 +29,18 @@ WAIT_ACTION = -1
 WAIT_DIRECTION = 4
 
 
+def wait_action_for_env(env: MazeEnv) -> int:
+    """Return the explicit wait action id for the given environment."""
+
+    return int(getattr(env, "wait_action_index", WAIT_ACTION))
+
+
+def is_wait_action(env: MazeEnv, action: int) -> bool:
+    """Return whether the action id represents a wait turn for this environment."""
+
+    return int(action) in {WAIT_ACTION, wait_action_for_env(env)}
+
+
 @dataclass(frozen=True)
 class ShowcaseResult:
     """One showcase row for a checkpoint episode."""
@@ -104,14 +116,14 @@ def describe_move_choice(env: MazeEnv, action: int) -> HeuristicMoveChoice | Non
     if env.player is None or env.layout is None or env.monster is None:
         return None
     threat_position = _threat_reference_position(env)
-    if action == WAIT_ACTION:
+    if is_wait_action(env, action):
         current_monster_distance = (
             _path_distance(env, env.player, threat_position)
             if threat_position is not None
             else 9999
         )
         return HeuristicMoveChoice(
-            action=action,
+            action=wait_action_for_env(env),
             direction=WAIT_DIRECTION,
             speed=0,
             target=env.player,
@@ -166,13 +178,15 @@ def rank_legal_moves(env: MazeEnv) -> list[HeuristicMoveChoice]:
     """Rank legal one-step moves to favor coverage and avoid local loops."""
 
     action_count = int(getattr(env.action_space, "n", 0))
+    wait_action = wait_action_for_env(env)
     choices = [
         choice
         for action in range(action_count)
+        if action != wait_action
         if (choice := describe_move_choice(env, action)) is not None
     ]
-    if _should_offer_wait(env, choices):
-        wait_choice = describe_move_choice(env, WAIT_ACTION)
+    if _should_offer_wait(env, choices) and not any(choice.wait_action for choice in choices):
+        wait_choice = describe_move_choice(env, wait_action)
         if wait_choice is not None:
             choices.append(wait_choice)
     fear_mode = _fear_mode(env, choices)
@@ -186,7 +200,7 @@ def choose_heuristic_action(env: MazeEnv) -> int:
     """Choose the best deterministic fallback action for the current state."""
 
     ranked = rank_legal_moves(env)
-    return ranked[0].action if ranked else 0
+    return ranked[0].action if ranked else wait_action_for_env(env)
 
 
 def _policy_decision_label(
@@ -285,6 +299,8 @@ def _project_action_target(env: MazeEnv, action: int) -> tuple[Position | None, 
 
     if env.player is None:
         return None, None, False
+    if is_wait_action(env, action):
+        return None, env.player, True
     direction, speed = env.decode_action(action)
     delta_row, delta_col = DIRECTION_DELTAS[direction]
     current = env.player
@@ -502,10 +518,6 @@ def should_override_policy(
     if chosen.immediate_reverse and not best.immediate_reverse:
         return True
     if chosen.short_loop_risk >= 6 and chosen.short_loop_risk > best.short_loop_risk:
-        return True
-    if chosen.known_dead_end and not best.known_dead_end:
-        return True
-    if chosen.enters_dead_end and not best.enters_dead_end:
         return True
     if not chosen.direct_monster_escape and best.direct_monster_escape and best.monster_distance_gain > 0:
         return True
@@ -772,7 +784,7 @@ class PlaybackSession:
                     self.last_override_reason = "break-loop"
                 else:
                     self.last_override_reason = "low-confidence"
-        if int(action) == WAIT_ACTION:
+        if is_wait_action(self.env, int(action)):
             direction = None
             speed = 0
             self.observation, _, terminated, truncated, info = self.env.step_wait()
@@ -912,7 +924,7 @@ class BaselinePlaybackSession:
             return self.latest_state, None
 
         action = self._choose_legal_action()
-        if int(action) == WAIT_ACTION:
+        if is_wait_action(self.env, int(action)):
             direction = None
             speed = 0
             self.observation, _, terminated, truncated, info = self.env.step_wait()
@@ -1001,7 +1013,15 @@ def load_checkpoint_for_playback(checkpoint_path: str | Path) -> tuple[Any, Maze
     """Load a checkpoint model and environment for deterministic playback."""
 
     metadata = load_checkpoint_metadata(checkpoint_path)
-    maze_config = maze_config_from_dict(metadata["maze_config"])
+    saved = metadata["maze_config"]
+    maze_config = maze_config_from_dict(saved)
+    # Always use the current code's step limit so old checkpoints get the
+    # updated budget without needing to retrain.
+    from maze_rl.training.train import maze_config_for_training_mode  # noqa: E402 — local to avoid circular import
+    current_cfg = maze_config_for_training_mode(MazeConfig(), "maze-only")
+    maze_config = MazeConfig(
+        **{**maze_config.__dict__, "max_episode_steps": current_cfg.max_episode_steps}
+    )
     env = MazeEnv(maze_config, training_mode=False)
     model = load_model_from_checkpoint(checkpoint_path, env)
     return model, env, metadata

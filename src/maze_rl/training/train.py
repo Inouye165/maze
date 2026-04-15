@@ -20,7 +20,7 @@ from maze_rl.config import (
     training_config_from_dict,
 )
 from maze_rl.envs.maze_env import MazeEnv
-from maze_rl.policies.model_factory import create_model, load_model_from_checkpoint
+from maze_rl.policies.model_factory import CheckpointCompatibilityError, create_model, load_model_from_checkpoint
 from maze_rl.training.checkpointing import (
     CheckpointManager,
     latest_checkpoint,
@@ -47,13 +47,14 @@ class ImmutableCheckpointCallback(BaseCallback):
         manager: CheckpointManager,
         training_config: TrainingConfig,
         maze_config: MazeConfig,
+        initial_training_summary: dict[str, Any] | None = None,
         start_episode: int = 0,
         target_episode: int | None = None,
         save_initial_checkpoint: bool = True,
         stop_event: threading.Event | None = None,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
-        report_every_timesteps: int = 100,
-        report_every_seconds: float = 5.0,
+        report_every_timesteps: int = 8,
+        report_every_seconds: float = 0.2,
         report_no_progress_steps: int = 10,
     ) -> None:
         super().__init__()
@@ -61,6 +62,7 @@ class ImmutableCheckpointCallback(BaseCallback):
         self.training_config = training_config
         self.maze_config = maze_config
         self.summary = RollingTrainingSummary()
+        self.summary.load_snapshot(initial_training_summary)
         self.completed_episodes = start_episode
         self.target_episode = (
             target_episode if target_episode is not None else training_config.episodes
@@ -123,6 +125,7 @@ class ImmutableCheckpointCallback(BaseCallback):
             "status": status,
             "completed_episodes": completed,
             "target_episodes": target,
+            "training_summary_snapshot": snapshot_summary,
             "session_start_episode": self._session_start_episode,
             "session_completed_episodes": completed - self._session_start_episode,
             "session_target_episodes": target - self._session_start_episode,
@@ -293,6 +296,7 @@ def continue_training_from_latest(
 
     latest_episode, checkpoint_path = latest
     metadata = load_checkpoint_metadata(checkpoint_path)
+    previous_training_summary = metadata.get("training_summary")
     maze_config = _with_fixed_seed(
         maze_config_for_training_mode(
             maze_config_from_dict(metadata["maze_config"]),
@@ -345,12 +349,16 @@ def continue_training_from_latest(
     training_config.replay_dir.mkdir(parents=True, exist_ok=True)
     manager = CheckpointManager(training_config=training_config, maze_config=maze_config)
     env = build_training_env(maze_config)
-    model = load_model_from_checkpoint(checkpoint_path, env)
+    try:
+        model = load_model_from_checkpoint(checkpoint_path, env)
+    except CheckpointCompatibilityError:
+        model = create_model(training_config=training_config, env=env)
     model.set_random_seed(training_config.seed)
     callback = ImmutableCheckpointCallback(
         manager=manager,
         training_config=training_config,
         maze_config=maze_config,
+        initial_training_summary=previous_training_summary if isinstance(previous_training_summary, dict) else None,
         start_episode=latest_episode,
         target_episode=latest_episode + additional_episodes,
         save_initial_checkpoint=False,
@@ -389,6 +397,7 @@ def maze_config_for_training_mode(maze_config: MazeConfig, training_mode: str) -
         # Keep this below exploration and exit progress so PPO still has to trade off,
         # but make avoidable visible dead ends costly enough to learn before contact.
         avoidable_visible_dead_end_penalty=-0.8,
+        trap_threat_penalty=-12.0,
         blocked_move_penalty=-2.0,
         exit_progress_reward=1.6,
         safety_gain_reward=1.8,
@@ -407,7 +416,7 @@ def maze_config_for_training_mode(maze_config: MazeConfig, training_mode: str) -
             "monster_speed": 1,
             "monster_activation_delay": 0,
             "monster_move_interval": 3,
-            "max_episode_steps": 280,
+            "max_episode_steps": 560,
             "stall_threshold": 90,
             "curriculum_enabled": False,
             "reward": reward,

@@ -78,6 +78,18 @@ class RollingTrainingSummary:
             self.total_avoidable_captures += 1
         self.episodes.append(metrics)
 
+    def load_snapshot(self, snapshot: dict[str, Any] | None) -> None:
+        """Hydrate aggregate counters from a previously saved training summary."""
+
+        if not isinstance(snapshot, dict):
+            return
+
+        self.total_episodes = int(snapshot.get("episodes_seen", 0))
+        self.total_wins = int(snapshot.get("wins", 0))
+        self.total_timeouts = int(snapshot.get("timeout_count", 0))
+        self.total_stalls = int(snapshot.get("stall_count", 0))
+        self.total_avoidable_captures = int(snapshot.get("avoidable_capture_count", 0))
+
     def snapshot(self) -> dict[str, Any]:
         """Build a serializable training summary."""
 

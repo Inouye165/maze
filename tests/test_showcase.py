@@ -494,6 +494,49 @@ def test_heuristic_does_not_wait_when_monster_would_close_distance() -> None:
     assert choice.wait_action is False
 
 
+def test_heuristic_can_return_explicit_wait_action_for_env() -> None:
+    """The heuristic should emit the environment wait action id when waiting is best."""
+
+    env = MazeEnv(
+        MazeConfig(
+            rows=5,
+            cols=7,
+            vision_range=4,
+            max_player_speed=1,
+            monster_speed=1,
+            monster_activation_delay=0,
+            curriculum_enabled=False,
+        ),
+        training_mode=False,
+    )
+    layout = MazeLayout(
+        grid=(
+            "#######",
+            "#.....#",
+            "###.###",
+            "#.....#",
+            "#######",
+        ),
+        player_start=Position(2, 3),
+        monster_start=Position(1, 1),
+        exit_position=Position(3, 5),
+        seed=132,
+    )
+    env.reset(seed=132, options={"layout": layout, "maze_seed": 132})
+    env.last_seen_monster_position = Position(1, 1)
+    env.turns_since_monster_seen = 1
+    env.known_dead_end_cells = {Position(1, 3), Position(3, 3)}
+    env.visited_counts = {Position(2, 3): 1, Position(1, 3): 2, Position(3, 3): 2}
+    env.path_history = deque([Position(1, 3), Position(2, 3)], maxlen=6)
+
+    action = choose_heuristic_action(env)
+    choice = describe_move_choice(env, action)
+
+    assert action == env.wait_action_index
+    assert choice is not None
+    assert choice.wait_action is True
+
+
 def test_playback_session_disables_override_by_default(monkeypatch) -> None:
     """Playback should default to raw policy moves and surface override visibility."""
 

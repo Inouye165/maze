@@ -19,6 +19,7 @@ class StepEvent:
     oscillation_severity: int
     dead_end_entries: int
     avoidable_visible_dead_end_entries: int
+    trap_threat_entries: int
     blocked_moves: int
     exit_progress_delta: float
     monster_distance_delta: float
@@ -38,6 +39,7 @@ class RewardBreakdown:
     oscillation: float
     dead_end: float
     avoidable_visible_dead_end: float
+    trap_threat: float
     blocking: float
     progress: float
     safety: float
@@ -55,6 +57,7 @@ def compute_reward(config: RewardConfig, event: StepEvent) -> RewardBreakdown:
     avoidable_visible_dead_end = (
         config.avoidable_visible_dead_end_penalty * event.avoidable_visible_dead_end_entries
     )
+    trap_threat = config.trap_threat_penalty * event.trap_threat_entries
     blocking = config.blocked_move_penalty * event.blocked_moves
     progress = config.exit_progress_reward * event.exit_progress_delta
 
@@ -81,6 +84,7 @@ def compute_reward(config: RewardConfig, event: StepEvent) -> RewardBreakdown:
         + oscillation
         + dead_end
         + avoidable_visible_dead_end
+        + trap_threat
         + blocking
         + progress
         + safety
@@ -94,6 +98,7 @@ def compute_reward(config: RewardConfig, event: StepEvent) -> RewardBreakdown:
         oscillation=oscillation,
         dead_end=dead_end,
         avoidable_visible_dead_end=avoidable_visible_dead_end,
+        trap_threat=trap_threat,
         blocking=blocking,
         progress=progress,
         safety=safety,

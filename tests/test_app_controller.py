@@ -12,7 +12,11 @@ from maze_rl.training.showcase import ShowcaseResult
 from maze_rl.training.train import maze_config_for_training_mode
 
 
-def _create_checkpoints(tmp_path: Path, episodes: tuple[int, ...] = (0,)) -> Path:
+def _create_checkpoints(
+    tmp_path: Path,
+    episodes: tuple[int, ...] = (0,),
+    summary_overrides: dict[int, dict[str, int]] | None = None,
+) -> Path:
     """Create one or more lightweight checkpoints for controller tests."""
 
     checkpoint_dir = tmp_path / "maze_only"
@@ -29,7 +33,7 @@ def _create_checkpoints(tmp_path: Path, episodes: tuple[int, ...] = (0,)) -> Pat
             model=model,
             episode=episode,
             timesteps=episode,
-            training_summary={"episodes_seen": episode},
+            training_summary={"episodes_seen": episode, **(summary_overrides or {}).get(episode, {})},
             evaluation_summary={"episodes": 1},
         )
     return checkpoint_dir
@@ -148,6 +152,52 @@ def test_play_runs_trained_mode_when_checkpoint_exists(tmp_path: Path) -> None:
     assert getattr(controller.session, "allow_policy_override", False) is True
 
 
+def test_play_falls_back_to_innate_when_selected_checkpoint_is_incompatible(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Play should stay visibly runnable by falling back to innate mode on incompatible checkpoints."""
+
+    _create_checkpoints(tmp_path, episodes=(0,))
+
+    class FakeBaselinePlaybackSession:
+        def __init__(self, maze_config, checkpoint_label: str, seed: int, debug_trace: bool) -> None:
+            _ = maze_config
+            _ = debug_trace
+            self.seed = seed
+            self.checkpoint_label = checkpoint_label
+            self.latest_state = {
+                "grid": ("###", "#.#", "###"),
+                "full_grid": ("###", "#.#", "###"),
+                "player_position": (1, 1),
+                "monster_position": (1, 1),
+                "exit_position": (1, 1),
+                "seed": seed,
+                "rendered_player_position": (1, 1),
+                "rendered_monster_position": (1, 1),
+            }
+
+        def advance(self):
+            return dict(self.latest_state), None
+
+    def fail_playback(**_kwargs):
+        raise CheckpointCompatibilityError("Observation spaces do not match")
+
+    monkeypatch.setattr("maze_rl.render.control_app.PlaybackSession", fail_playback)
+    monkeypatch.setattr("maze_rl.render.control_app.BaselinePlaybackSession", FakeBaselinePlaybackSession)
+
+    controller = LabAppController(checkpoint_dir=tmp_path)
+
+    controller.start_play()
+
+    assert controller.session is not None
+    assert controller.current_mode == "baseline-legal-mover"
+    assert controller.seed_ladder_active is True
+    assert controller.play_mode_status() == "Policy: Innate"
+    assert "incompatible" in controller.training_message
+    assert "innate policy" in controller.training_message
+
+
 def test_play_increments_seed_until_loss_then_trains_failed_seed(
     tmp_path: Path,
     monkeypatch,
@@ -256,6 +306,44 @@ def test_play_increments_seed_until_loss_then_trains_failed_seed(
 
     assert captured_training_calls == [(7, "maze-only", 2)]
     assert controller.pending_training_seed is None
+
+
+def test_play_prefers_explicitly_selected_seed_over_armed_training_seed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """If the user changes Start Seed, Play should start that seed instead of training the armed failed one."""
+
+    _create_checkpoints(tmp_path, episodes=(0,))
+    captured_training_calls: list[tuple[int, str, int]] = []
+
+    def fake_continue_training_from_latest(
+        additional_episodes: int,
+        checkpoint_dir: Path,
+        training_mode: str,
+        stop_event,
+        fixed_maze_seed: int,
+    ) -> None:
+        _ = checkpoint_dir
+        _ = stop_event
+        captured_training_calls.append((additional_episodes, training_mode, fixed_maze_seed))
+
+    monkeypatch.setattr(
+        "maze_rl.render.control_app.continue_training_from_latest",
+        fake_continue_training_from_latest,
+    )
+
+    controller = LabAppController(checkpoint_dir=tmp_path)
+    controller.pending_training_seed = 2
+    controller.set_seed_value(7)
+
+    controller.start_play()
+
+    assert captured_training_calls == []
+    assert controller.pending_training_seed is None
+    assert controller.seed_ladder_active is True
+    assert controller.session is not None
+    assert controller.current_run_seed == 7
 
 
 def test_app_controller_uses_mode_specific_checkpoint_directories(tmp_path: Path) -> None:
@@ -438,8 +526,79 @@ def test_training_progress_summary_and_render_state_show_live_training_seed_and_
     assert render_state["checkpoint_label"] == "training seed 424242"
 
 
+def test_training_cards_prefer_live_training_summary_snapshot() -> None:
+    """The dashboard should show in-flight training totals before a checkpoint is written."""
+
+    controller = LabAppController(checkpoint_dir=Path("unused"))
+
+    class _AliveThread:
+        def is_alive(self) -> bool:
+            return True
+
+    controller.training_thread = _AliveThread()  # type: ignore[assignment]
+    controller.training_progress = {
+        "training_summary_snapshot": {
+            "episodes_seen": 215,
+            "wins": 97,
+            "recent_10_outcomes": ["escaped"] * 7 + ["caught"] * 3,
+            "recent_100_outcomes": ["escaped"] * 62 + ["caught"] * 38,
+            "recent_1000_outcomes": ["escaped"] * 150 + ["caught"] * 65,
+            "recent_outcomes": ["escaped"] * 150 + ["caught"] * 65,
+        }
+    }
+
+    all_time = controller.all_time_training_card()
+    cards = controller.training_stat_cards()
+
+    assert all_time.cycles == 215
+    assert all_time.wins == 97
+    assert cards[0].cycles == 10
+    assert cards[0].wins == 7
+    assert cards[1].cycles == 100
+    assert cards[1].wins == 35
+
+
+def test_training_cards_ignore_stale_live_summary_after_training_finishes(tmp_path: Path) -> None:
+    """Finished training should fall back to the persisted checkpoint totals."""
+
+    _create_checkpoints(
+        tmp_path,
+        episodes=(20,),
+        summary_overrides={20: {"episodes_seen": 20, "wins": 12}},
+    )
+    controller = LabAppController(checkpoint_dir=tmp_path)
+    controller.training_progress = {
+        "training_summary_snapshot": {
+            "episodes_seen": 10,
+            "wins": 4,
+            "recent_10_outcomes": ["escaped"] * 4 + ["caught"] * 6,
+            "recent_outcomes": ["escaped"] * 4 + ["caught"] * 6,
+        }
+    }
+
+    all_time = controller.all_time_training_card()
+
+    assert all_time.cycles == 20
+    assert all_time.wins == 12
+
+
+def test_render_state_defaults_to_seeded_idle_preview() -> None:
+    """The idle viewport should show the starting maze for the current seed."""
+
+    controller = LabAppController(checkpoint_dir=Path("unused"))
+
+    render_state = controller.render_state()
+
+    assert render_state is not None
+    assert render_state["seed"] == 1
+    assert render_state["checkpoint_label"] == "seed preview 00001"
+    assert render_state["outcome"] == "ready"
+    assert render_state["grid"]
+    assert render_state["full_grid"]
+
+
 def test_maze_learning_mode_simplifies_actions_and_slows_monster() -> None:
-    """Maze-learning mode should use 4 directions with a slow monster."""
+    """Maze-learning mode should use 4 directions plus wait with a slow monster."""
 
     maze_only = maze_config_for_training_mode(MazeConfig(), "maze-only")
     env = MazeEnv(maze_only)
@@ -448,9 +607,9 @@ def test_maze_learning_mode_simplifies_actions_and_slows_monster() -> None:
     assert maze_only.max_player_speed == 1
     assert maze_only.monster_speed == 1
     assert maze_only.monster_move_interval == 3
-    assert maze_only.max_episode_steps == 280
+    assert maze_only.max_episode_steps == 560
     assert maze_only.stall_threshold == 90
-    assert getattr(env.action_space, "n", None) == 4
+    assert getattr(env.action_space, "n", None) == 5
     assert maze_only.reward.exit_progress_reward >= 1.5
     assert maze_only.reward.safety_gain_reward >= 1.8
     assert maze_only.reward.safety_loss_penalty <= -3.0

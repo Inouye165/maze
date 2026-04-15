@@ -19,6 +19,7 @@ class RewardConfig:
     oscillation_penalty: float = -1.8
     dead_end_penalty: float = -1.0
     avoidable_visible_dead_end_penalty: float = -0.65
+    trap_threat_penalty: float = -4.0
     blocked_move_penalty: float = -0.5
     exit_progress_reward: float = 0.2
     safety_gain_reward: float = 0.1
@@ -137,17 +138,28 @@ def as_serializable_dict(config: Any) -> dict[str, Any]:
     raise TypeError(f"Unsupported config type: {type(config)!r}")
 
 
+def _filter_dataclass_kwargs(dataclass_type: type[Any], payload: dict[str, Any]) -> dict[str, Any]:
+    """Drop unknown serialized fields so old checkpoints stay loadable."""
+
+    allowed_fields = getattr(dataclass_type, "__dataclass_fields__", {})
+    return {key: value for key, value in payload.items() if key in allowed_fields}
+
+
 def maze_config_from_dict(data: dict[str, Any]) -> MazeConfig:
     """Rebuild MazeConfig from serialized metadata."""
 
     normalized = dict(data)
     reward = normalized.get("reward")
     if isinstance(reward, dict):
-        normalized["reward"] = RewardConfig(**reward)
+        normalized["reward"] = RewardConfig(**_filter_dataclass_kwargs(RewardConfig, reward))
     curriculum = normalized.get("curriculum")
     if isinstance(curriculum, list):
-        normalized["curriculum"] = tuple(CurriculumStage(**item) for item in curriculum)
-    return MazeConfig(**normalized)
+        normalized["curriculum"] = tuple(
+            CurriculumStage(**_filter_dataclass_kwargs(CurriculumStage, item))
+            for item in curriculum
+            if isinstance(item, dict)
+        )
+    return MazeConfig(**_filter_dataclass_kwargs(MazeConfig, normalized))
 
 
 def training_config_from_dict(data: dict[str, Any]) -> TrainingConfig:
@@ -159,4 +171,4 @@ def training_config_from_dict(data: dict[str, Any]) -> TrainingConfig:
             normalized[key] = Path(normalized[key])
     if isinstance(normalized.get("checkpoint_episodes"), list):
         normalized["checkpoint_episodes"] = tuple(normalized["checkpoint_episodes"])
-    return TrainingConfig(**normalized)
+    return TrainingConfig(**_filter_dataclass_kwargs(TrainingConfig, normalized))

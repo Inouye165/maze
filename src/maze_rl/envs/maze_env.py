@@ -59,7 +59,7 @@ class MazeEnv(gym.Env[np.ndarray, int]):
         self.training_mode = training_mode
         self.observation_spec = ObservationSpec(rows=self.config.rows, cols=self.config.cols)
         self.observation_space = build_observation_space(self.observation_spec)
-        self.action_space = gym.spaces.Discrete(4 * self.config.max_player_speed)
+        self.action_space = gym.spaces.Discrete(4 * self.config.max_player_speed + 1)
         self._episode_index = 0
         self._latest_seed = self.config.train_seed_base
         self._active_rows = self.config.rows
@@ -92,6 +92,7 @@ class MazeEnv(gym.Env[np.ndarray, int]):
         self.entered_visible_dead_end = 0
         self.avoided_visible_dead_end = 0
         self.avoidable_visible_dead_end_penalties_applied = 0
+        self.trap_threat_penalties_applied = 0
         self.revisits = 0
         self.oscillations = 0
         self.blocked_moves = 0
@@ -109,6 +110,73 @@ class MazeEnv(gym.Env[np.ndarray, int]):
         self.path_history: deque[Position] = deque(maxlen=6)
         self._scheduled_focus_seed: int | None = None
         self._game_score = 0
+
+    def _frontier_anchor_cells(self) -> set[Position]:
+        """Return seen cells that border at least one still-unknown tile."""
+
+        if self.layout is None:
+            return set()
+
+        anchors: set[Position] = set()
+        for position in self.seen_open_cells:
+            for delta_row, delta_col in DIRECTION_DELTAS:
+                candidate = position.shifted(delta_row, delta_col)
+                if (
+                    candidate.row < 0
+                    or candidate.col < 0
+                    or candidate.row >= self.layout.rows
+                    or candidate.col >= self.layout.cols
+                ):
+                    continue
+                if candidate in self.seen_open_cells or candidate in self.seen_wall_cells:
+                    continue
+                anchors.add(position)
+                break
+        return anchors
+
+    def _shortest_seen_distance_to_any(
+        self,
+        start: Position,
+        goals: set[Position],
+    ) -> int | None:
+        """Return the shortest remembered-path distance to any reachable goal."""
+
+        if start not in self.seen_open_cells or not goals:
+            return None
+        if start in goals:
+            return 0
+
+        queue: deque[tuple[Position, int]] = deque([(start, 0)])
+        visited = {start}
+        while queue:
+            current, distance = queue.popleft()
+            for delta_row, delta_col in DIRECTION_DELTAS:
+                candidate = current.shifted(delta_row, delta_col)
+                if candidate in visited or candidate not in self.seen_open_cells:
+                    continue
+                if candidate in goals:
+                    return distance + 1
+                visited.add(candidate)
+                queue.append((candidate, distance + 1))
+        return None
+
+    def _strategic_path_distances(self) -> tuple[int | None, int | None]:
+        """Return remembered-path distances to the known exit and nearest frontier."""
+
+        if self.player is None or self.layout is None:
+            return None, None
+
+        exit_distance: int | None = None
+        if self.layout.exit_position in self.seen_open_cells:
+            exit_distance = self._shortest_seen_distance_to_any(
+                self.player,
+                {self.layout.exit_position},
+            )
+        frontier_distance = self._shortest_seen_distance_to_any(
+            self.player,
+            self._frontier_anchor_cells(),
+        )
+        return exit_distance, frontier_distance
 
     def reset(
         self,
@@ -177,6 +245,7 @@ class MazeEnv(gym.Env[np.ndarray, int]):
         self.entered_visible_dead_end = 0
         self.avoided_visible_dead_end = 0
         self.avoidable_visible_dead_end_penalties_applied = 0
+        self.trap_threat_penalties_applied = 0
         self.revisits = 0
         self.oscillations = 0
         self.blocked_moves = 0
@@ -206,6 +275,9 @@ class MazeEnv(gym.Env[np.ndarray, int]):
     def step(self, action: int) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
         if self.layout is None or self.player is None or self.monster is None:
             raise RuntimeError("Environment must be reset before stepping.")
+
+        if int(action) == self.wait_action_index:
+            return self.step_wait()
 
         direction_index, player_speed = self.decode_action(action)
         return self._step_decoded(direction_index=direction_index, player_speed=player_speed, action_index=int(action))
@@ -239,6 +311,7 @@ class MazeEnv(gym.Env[np.ndarray, int]):
         player_can_continue = True
         previous_exit_distance = self._distance(self.player, self.layout.exit_position)
         previous_monster_distance = self._distance(self.player, self.monster)
+        previous_known_exit_distance, previous_known_frontier_distance = self._strategic_path_distances()
         direction_summaries = self._visible_direction_summaries()
         chosen_direction_summary = (
             direction_summaries[direction_index] if direction_index is not None else None
@@ -253,6 +326,7 @@ class MazeEnv(gym.Env[np.ndarray, int]):
         step_avoidable_capture = False
         step_avoidable_capture_reason: str | None = None
         avoidable_visible_dead_end_entries = 0
+        trap_threat_entries = 0
         player_start = self.player
         monster_start = self.monster
         player_path: list[Position] = []
@@ -278,6 +352,16 @@ class MazeEnv(gym.Env[np.ndarray, int]):
         if step_visible_dead_end_opportunity and step_entered_visible_dead_end:
             avoidable_visible_dead_end_entries = 1
             self.avoidable_visible_dead_end_penalties_applied += 1
+        if (
+            step_entered_visible_dead_end
+            and step_escape_move_available
+            and step_best_escape_action is not None
+            and action_index is not None
+            and step_best_escape_action != int(action_index)
+            and self._is_trap_threat_active(previous_monster_distance)
+        ):
+            trap_threat_entries = 1
+            self.trap_threat_penalties_applied += 1
 
         if direction_index is None:
             micro_steps.append(
@@ -417,7 +501,32 @@ class MazeEnv(gym.Env[np.ndarray, int]):
             oscillation_severity += self.repeat_move_streak
 
         if new_cells == 0 and frontier_cells == 0:
-            self.no_progress_steps += 1
+            current_known_exit_distance, current_known_frontier_distance = self._strategic_path_distances()
+            exit_progress = (
+                previous_known_exit_distance is not None
+                and current_known_exit_distance is not None
+                and current_known_exit_distance < previous_known_exit_distance
+            )
+            frontier_progress = (
+                previous_known_frontier_distance is not None
+                and current_known_frontier_distance is not None
+                and current_known_frontier_distance < previous_known_frontier_distance
+            )
+            threat_recently_known = self.monster in self.visible_open_cells or (
+                self.turns_since_monster_seen is not None and self.turns_since_monster_seen <= 3
+            )
+            tactical_progress = (
+                threat_recently_known
+                and self._distance(self.player, self.monster) > previous_monster_distance
+                and (
+                    current_known_exit_distance is not None
+                    or current_known_frontier_distance is not None
+                )
+            )
+            if exit_progress or frontier_progress or tactical_progress:
+                self.no_progress_steps = 0
+            else:
+                self.no_progress_steps += 1
         else:
             self.no_progress_steps = 0
         self.peak_no_progress_steps = max(self.peak_no_progress_steps, self.no_progress_steps)
@@ -450,6 +559,7 @@ class MazeEnv(gym.Env[np.ndarray, int]):
                 oscillation_severity=oscillation_severity,
                 dead_end_entries=dead_end_entries,
                 avoidable_visible_dead_end_entries=avoidable_visible_dead_end_entries,
+                trap_threat_entries=trap_threat_entries,
                 blocked_moves=blocked_moves,
                 exit_progress_delta=exit_progress_delta,
                 monster_distance_delta=monster_distance_delta,
@@ -505,9 +615,11 @@ class MazeEnv(gym.Env[np.ndarray, int]):
             "entered_visible_dead_end": self.entered_visible_dead_end,
             "avoided_visible_dead_end": self.avoided_visible_dead_end,
             "avoidable_visible_dead_end_penalties_applied": self.avoidable_visible_dead_end_penalties_applied,
+            "trap_threat_penalties_applied": self.trap_threat_penalties_applied,
             "step_visible_dead_end_opportunity": step_visible_dead_end_opportunity,
             "step_entered_visible_dead_end": step_entered_visible_dead_end,
             "step_avoided_visible_dead_end": step_avoided_visible_dead_end,
+            "step_trap_threat_entry": bool(trap_threat_entries),
             "blocked_moves": self.blocked_moves,
             "illegal_moves": self.blocked_moves,
             "outcome": reason,
@@ -566,11 +678,20 @@ class MazeEnv(gym.Env[np.ndarray, int]):
     def decode_action(self, action: int) -> tuple[int, int]:
         """Decode the flattened discrete action into direction and speed."""
 
+        if int(action) == self.wait_action_index:
+            raise ValueError("Wait action does not map to a movement direction.")
+
         direction = int(action) // self.config.max_player_speed
         speed = int(action) % self.config.max_player_speed + 1
         if not 0 <= direction < 4:
             raise ValueError(f"Invalid direction index: {direction}")
         return direction, speed
+
+    @property
+    def wait_action_index(self) -> int:
+        """Return the discrete action id for an explicit wait turn."""
+
+        return 4 * self.config.max_player_speed
 
     def action_masks(self) -> list[bool]:
         """Return a legal-action mask for algorithms that support masking."""
@@ -581,12 +702,19 @@ class MazeEnv(gym.Env[np.ndarray, int]):
 
         masks: list[bool] = []
         for action in range(int(self.action_space.n)):
+            if action == self.wait_action_index:
+                masks.append(False)
+                continue
             _first_step_target, _target, completed_full_speed = _project_action_target(self, action)
             masks.append(completed_full_speed)
         ranked_moves = rank_legal_moves(self)
         best_move = ranked_moves[0] if ranked_moves else None
         if best_move is None:
             return masks
+        if best_move.wait_action:
+            wait_masks = [False] * int(self.action_space.n)
+            wait_masks[self.wait_action_index] = True
+            return wait_masks
         if self.monster is not None and self.monster in self.visible_open_cells and best_move.monster_distance_gain > 0:
             flee_masks = [False] * int(self.action_space.n)
             if 0 <= best_move.action < len(flee_masks):
@@ -604,6 +732,17 @@ class MazeEnv(gym.Env[np.ndarray, int]):
         if any(filtered_masks):
             return filtered_masks
         return masks
+
+    def _is_trap_threat_active(self, current_monster_distance: int) -> bool:
+        """Return whether entering a known dead route should be punished immediately."""
+
+        if self.player is None or self.monster is None:
+            return False
+        monster_visible = self.monster in self.visible_open_cells
+        monster_recent = self.turns_since_monster_seen is not None and self.turns_since_monster_seen <= 3
+        if not monster_visible and not monster_recent:
+            return False
+        return current_monster_distance <= max(4, self.player_vision_range)
 
     def get_render_state(self) -> dict[str, Any]:
         """Return a lightweight snapshot for the local viewer."""
@@ -641,6 +780,7 @@ class MazeEnv(gym.Env[np.ndarray, int]):
 
         if self.layout is None or self.player is None or self.monster is None:
             raise RuntimeError("Environment must be reset before rendering.")
+        known_exit_distance, known_frontier_distance = self._strategic_path_distances()
         return {
             "grid": self._knowledge_grid(),
             "full_grid": self.layout.grid,
@@ -669,6 +809,8 @@ class MazeEnv(gym.Env[np.ndarray, int]):
             "monster_speed": self._active_monster_speed,
             "monster_activation_delay": self._active_monster_activation_delay,
             "steps": self.step_count,
+            "max_episode_steps": self._active_max_episode_steps,
+            "stall_threshold": self._active_stall_threshold,
             "coverage": self.coverage,
             "revisits": self.revisits,
             "oscillations": self.oscillations,
@@ -676,9 +818,13 @@ class MazeEnv(gym.Env[np.ndarray, int]):
             "blocked_moves": self.blocked_moves,
             "illegal_moves": self.blocked_moves,
             "discovered_cells": self.discovered_cells,
+            "no_progress_steps": self.no_progress_steps,
             "repeat_move_streak": self.repeat_move_streak,
             "peak_repeat_move_streak": self.peak_repeat_move_streak,
             "repeat_loop_warning": self.repeat_move_streak >= 3,
+            "known_exit_path_distance": known_exit_distance,
+            "known_frontier_path_distance": known_frontier_distance,
+            "frontier_anchor_count": len(self._frontier_anchor_cells()),
             "visible_dead_end_opportunities": self.visible_dead_end_opportunities,
             "entered_visible_dead_end": self.entered_visible_dead_end,
             "avoided_visible_dead_end": self.avoided_visible_dead_end,

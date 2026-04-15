@@ -16,6 +16,7 @@ from typing import Any, Callable
 import pygame
 
 from maze_rl.config import MazeConfig, maze_config_from_dict
+from maze_rl.envs.maze_env import MazeEnv
 from maze_rl.policies.model_factory import CheckpointCompatibilityError
 from maze_rl.render.view_state import (
     viewer_cell_color,
@@ -141,6 +142,8 @@ class LabAppController:
         self.compare_results: list[ShowcaseResult] = []
         self.compare_pause_until = 0.0
         self.compare_pause_s = 0.9
+        self._idle_preview_cache_key: tuple[int, str, int | None] | None = None
+        self._idle_preview_state: dict[str, Any] | None = None
         self.refresh_checkpoints()
         if self.available_checkpoints:
             self.selected_mode = "current-learned-ai"
@@ -349,27 +352,56 @@ class LabAppController:
         """Run the seed ladder until the first loss, then train on that failed maze."""
 
         if self.pending_training_seed is not None:
-            cycles = self.parse_cycle_count()
-            failed_seed = self.pending_training_seed
-            self.pending_training_seed = None
-            self.start_training(cycles, fixed_maze_seed=failed_seed)
-            if self.training_status == "running":
-                self.training_message = (
-                    f"training starts on failed seed {self.format_seed(failed_seed)} "
-                    f"for {cycles} cycles"
-                )
-            return
+            if self.parse_seed() != self.pending_training_seed:
+                self.pending_training_seed = None
+                self.seed_ladder_active = False
+                self.training_message = "armed training cleared; starting from the selected seed"
+            else:
+                cycles = self.parse_cycle_count()
+                failed_seed = self.pending_training_seed
+                self.pending_training_seed = None
+                self.start_training(cycles, fixed_maze_seed=failed_seed)
+                if self.training_status == "running":
+                    self.training_message = (
+                        f"training starts on failed seed {self.format_seed(failed_seed)} "
+                        f"for {cycles} cycles"
+                    )
+                return
 
         self.seed_ladder_active = True
         start_seed = self.parse_seed()
-        if self.selected_checkpoint is None:
-            self._start_baseline_legal_mover(seed=start_seed, preserve_seed_ladder=True)
-            if self.session is not None:
-                self.training_message = f"seed ladder started at {self.format_seed(start_seed)} using innate policy"
+        if self._start_seed_ladder_run(start_seed):
             return
-        self._start_current_ai_run(seed=start_seed, preserve_seed_ladder=True)
+        self.seed_ladder_active = False
+
+    def _start_seed_ladder_run(self, seed: int) -> bool:
+        """Start one seed-ladder run, falling back to the innate policy if needed."""
+
+        selected = self.selected_checkpoint
+        if selected is None:
+            self._start_baseline_legal_mover(seed=seed, preserve_seed_ladder=True)
+            if self.session is not None:
+                self.training_message = f"seed ladder started at {self.format_seed(seed)} using innate policy"
+                return True
+            return False
+
+        selected_episode = selected[0]
+        self._start_current_ai_run(seed=seed, preserve_seed_ladder=True)
         if self.session is not None:
-            self.training_message = f"seed ladder started at {self.format_seed(start_seed)} using the active checkpoint"
+            self.training_message = f"seed ladder started at {self.format_seed(seed)} using the active checkpoint"
+            return True
+
+        if "incompatible" not in self.training_message.lower():
+            return False
+
+        self._start_baseline_legal_mover(seed=seed, preserve_seed_ladder=True)
+        if self.session is None:
+            return False
+        self.training_message = (
+            f"ckpt {selected_episode:04d} is incompatible on this branch; "
+            f"seed ladder started at {self.format_seed(seed)} using innate policy"
+        )
+        return True
 
     def start_marks_play(self) -> None:
         """Backward-compatible alias for the plain-English Play action."""
@@ -646,11 +678,7 @@ class LabAppController:
         if result.outcome == "escaped":
             next_seed = run_seed + 1
             self.set_seed_value(next_seed)
-            if self.selected_checkpoint is None:
-                self._start_baseline_legal_mover(seed=next_seed, preserve_seed_ladder=True)
-            else:
-                self._start_current_ai_run(seed=next_seed, preserve_seed_ladder=True)
-            if self.session is not None:
+            if self._start_seed_ladder_run(next_seed):
                 self.training_message = (
                     f"seed {self.format_seed(run_seed)} cleared, advancing to {self.format_seed(next_seed)}"
                 )
@@ -786,6 +814,13 @@ class LabAppController:
     def play_mode_status(self) -> str:
         """Return the small plain-English mode label shown near Play."""
 
+        if self.current_mode == "baseline-legal-mover":
+            return "Policy: Innate"
+        if self.current_mode == "current-learned-ai":
+            selected = self.selected_checkpoint
+            if selected is None:
+                return "Policy: Trained"
+            return f"Policy: Trained (ckpt {selected[0]:04d})"
         selected = self.selected_checkpoint
         if selected is None:
             return "Policy: Innate"
@@ -794,6 +829,9 @@ class LabAppController:
     def all_time_training_card(self) -> TrainingStatCard:
         """Return the compact all-time training summary for the Basic tab."""
 
+        summary = self.current_training_summary()
+        if summary is not None:
+            return self._build_training_stat_card("All Trained", summary, None)
         cycles = self.total_runs
         wins = self.total_wins
         losses = max(0, cycles - wins)
@@ -808,6 +846,13 @@ class LabAppController:
     def training_stat_cards(self) -> list[TrainingStatCard]:
         """Return app run outcome cards for last 10, 100, and 1000 seeds."""
 
+        summary = self.current_training_summary()
+        if summary is not None:
+            return [
+                self._build_training_stat_card("Last 10", summary, 10),
+                self._build_training_stat_card("Last 100", summary, 100),
+                self._build_training_stat_card("Last 1000", summary, 1000),
+            ]
         return [
             self._build_outcome_stat_card("Last 10", 10),
             self._build_outcome_stat_card("Last 100", 100),
@@ -817,21 +862,108 @@ class LabAppController:
     def primary_status_lines(self) -> list[str]:
         """Return concise status lines for the basic tab."""
 
-        latest_summary = self.latest_training_summary()
+        latest_summary = self.current_training_summary()
         last_outcome = self.last_result.outcome if self.last_result is not None else "none yet"
         cycles_seen = 0 if latest_summary is None else int(latest_summary.get("episodes_seen", 0))
         active_seed = self.active_training_seed()
         pinned_seed = self.last_requested_training_seed
         seed_suffix = "" if active_seed is None else f" | Live train seed: {self.format_seed(active_seed)}"
         pinned_suffix = "dynamic" if pinned_seed is None else self.format_seed(pinned_seed)
+        state = self.render_state() or {}
+        known_exit = state.get("known_exit_path_distance")
+        known_frontier = state.get("known_frontier_path_distance")
+        frontier_anchors = state.get("frontier_anchor_count", 0)
+        no_progress = state.get("no_progress_steps", 0)
+        stall_threshold = state.get("stall_threshold", "?")
+        steps = state.get("steps", 0)
+        max_steps = state.get("max_episode_steps", "?")
         return [
             f"Start seed: {self.format_seed(self.parse_seed())} | Train cycles: {self.parse_cycle_count()}",
             f"{self.play_mode_status()} | Last outcome: {last_outcome}",
             f"Ladder: {'running' if self.seed_ladder_active else 'idle'} | Last failed seed: {self.format_seed(self.last_failed_seed) if self.last_failed_seed is not None else 'none'}",
             f"Training armed: {self.format_seed(self.pending_training_seed) if self.pending_training_seed is not None else 'no'}",
+            f"Paths: exit {known_exit if known_exit is not None else 'unknown'} | frontier {known_frontier if known_frontier is not None else 'unknown'} | anchors {frontier_anchors}",
+            f"Limits: no-progress {no_progress}/{stall_threshold} | steps {steps}/{max_steps}",
             f"Training mode: {self.training_mode_label()} | Focus seed: {pinned_suffix}",
             f"Training status: {self.training_status} | Cycles completed: {cycles_seen}",
             f"Status: {self.training_message}{seed_suffix}",
+        ]
+
+    def primary_status_segments(self) -> list[list[tuple[str, bool]]]:
+        """Return status lines with regular labels and bold dynamic values."""
+
+        latest_summary = self.current_training_summary()
+        cycles_seen = 0 if latest_summary is None else int(latest_summary.get("episodes_seen", 0))
+        active_seed = self.active_training_seed()
+        pinned_seed = self.last_requested_training_seed
+        last_outcome = self.last_result.outcome if self.last_result is not None else "none yet"
+        state = self.render_state() or {}
+        known_exit = state.get("known_exit_path_distance")
+        known_frontier = state.get("known_frontier_path_distance")
+        frontier_anchors = state.get("frontier_anchor_count", 0)
+        no_progress = state.get("no_progress_steps", 0)
+        stall_threshold = state.get("stall_threshold", "?")
+        steps = state.get("steps", 0)
+        max_steps = state.get("max_episode_steps", "?")
+        return [
+            [
+                ("Start seed: ", False),
+                (self.format_seed(self.parse_seed()), True),
+                (" | Train cycles: ", False),
+                (str(self.parse_cycle_count()), True),
+            ],
+            [
+                ("Policy: ", False),
+                (self.play_mode_status().replace("Policy: ", ""), True),
+                (" | Last outcome: ", False),
+                (last_outcome, True),
+            ],
+            [
+                ("Ladder: ", False),
+                ("running" if self.seed_ladder_active else "idle", True),
+                (" | Last failed seed: ", False),
+                (self.format_seed(self.last_failed_seed) if self.last_failed_seed is not None else "none", True),
+            ],
+            [
+                ("Training armed: ", False),
+                (self.format_seed(self.pending_training_seed) if self.pending_training_seed is not None else "no", True),
+            ],
+            [
+                ("Paths: exit ", False),
+                (str(known_exit) if known_exit is not None else "unknown", True),
+                (" | frontier ", False),
+                (str(known_frontier) if known_frontier is not None else "unknown", True),
+                (" | anchors ", False),
+                (str(frontier_anchors), True),
+            ],
+            [
+                ("Limits: no-progress ", False),
+                (str(no_progress), True),
+                ("/", False),
+                (str(stall_threshold), True),
+                (" | steps ", False),
+                (str(steps), True),
+                ("/", False),
+                (str(max_steps), True),
+            ],
+            [
+                ("Training mode: ", False),
+                (self.training_mode_label(), True),
+                (" | Focus seed: ", False),
+                ("dynamic" if pinned_seed is None else self.format_seed(pinned_seed), True),
+            ],
+            [
+                ("Training status: ", False),
+                (self.training_status, True),
+                (" | Cycles completed: ", False),
+                (str(cycles_seen), True),
+            ],
+            [
+                ("Status: ", False),
+                (self.training_message, True),
+                (" | Live train seed: ", False) if active_seed is not None else ("", False),
+                (self.format_seed(active_seed), True) if active_seed is not None else ("", True),
+            ],
         ]
 
     def training_progress_summary(self) -> str:
@@ -904,7 +1036,58 @@ class LabAppController:
         training_preview = self.training_preview_state()
         if training_preview is not None:
             return training_preview
-        return self.last_state
+        if self.last_state is not None:
+            return self.last_state
+        return self.idle_preview_state()
+
+    def idle_preview_state(self) -> dict[str, Any]:
+        """Return a deterministic starting maze preview for the current seed."""
+
+        preview_seed = self.parse_seed()
+        selected = self.selected_checkpoint
+        selected_episode = None if selected is None else selected[0]
+        cache_key = (preview_seed, self.training_mode, selected_episode)
+        if self._idle_preview_cache_key == cache_key and self._idle_preview_state is not None:
+            return self._idle_preview_state
+
+        env = MazeEnv(self._maze_config_for_active_run())
+        env.reset(seed=preview_seed, options={"maze_seed": preview_seed})
+        snapshot = env.get_render_state()
+        player_position = tuple(snapshot.get("player_position", (0, 0)))
+        monster_position = tuple(snapshot.get("monster_position", (0, 0)))
+        preview_state = dict(snapshot)
+        preview_state.update(
+            {
+                "checkpoint_label": f"seed preview {self.format_seed(preview_seed)}",
+                "outcome": "ready",
+                "peak_no_progress_streak": 0,
+                "start_monster_distance": env.start_monster_distance,
+                "time_to_capture": None,
+                "frontier_rate": 0.0,
+                "action_index": None,
+                "action_direction": None,
+                "action_speed": None,
+                "capture_diagnostics": {},
+                "replay_turn": None,
+                "turn_step": 0,
+                "policy_kind": "preview",
+                "policy_override_enabled": False,
+                "policy_override_count": 0,
+                "policy_override_reason": None,
+                "policy_decision_label": "seed preview",
+                "current_micro_step": 0,
+                "micro_step_count": 0,
+                "micro_actor": None,
+                "micro_phase": "idle",
+                "rendered_player_position": player_position,
+                "rendered_monster_position": monster_position,
+                "committed_player_position": player_position,
+                "committed_monster_position": monster_position,
+            }
+        )
+        self._idle_preview_cache_key = cache_key
+        self._idle_preview_state = preview_state
+        return preview_state
 
     def training_progress_ratio(self) -> float:
         """Return a 0..1 completion ratio for the current training session."""
@@ -928,7 +1111,7 @@ class LabAppController:
                     f"Recent win %: 10={cards[0].percentage * 100:.0f}% | 100={cards[1].percentage * 100:.0f}% | 1000={cards[2].percentage * 100:.0f}%",
                 ]
             )
-        latest_summary = self.latest_training_summary()
+        latest_summary = self.current_training_summary()
         if latest_summary is not None:
             lines.extend(
                 [
@@ -994,6 +1177,16 @@ class LabAppController:
         summary = metadata.get("training_summary")
         return summary if isinstance(summary, dict) else None
 
+    def current_training_summary(self) -> dict[str, Any] | None:
+        """Return the live training summary when available, else the latest persisted one."""
+
+        progress = self.training_progress
+        if self.is_training_active and isinstance(progress, dict):
+            live_summary = progress.get("training_summary_snapshot")
+            if isinstance(live_summary, dict):
+                return live_summary
+        return self.latest_training_summary()
+
     def _active_policy_label(self) -> str:
         """Describe the current play mode in plain English."""
 
@@ -1050,7 +1243,9 @@ class LabControlApp:
         self.buttons: list[Button] = []
         self._running = False
         self.font: Any = None
+        self.font_bold: Any = None
         self.small_font: Any = None
+        self.small_font_bold: Any = None
         self.heading_font: Any = None
         self.title_font: Any = None
 
@@ -1062,8 +1257,10 @@ class LabControlApp:
         screen = pygame.display.set_mode(self.window_size)
         pygame.display.set_caption("Maze RL Lab")
         self.font = pygame.font.SysFont("bahnschrift", 18)
+        self.font_bold = pygame.font.SysFont("bahnschrift", 18)
         self.small_font = pygame.font.SysFont("bahnschrift", 15)
-        self.heading_font = pygame.font.SysFont("bahnschrift", 24, bold=True)
+        self.small_font_bold = pygame.font.SysFont("bahnschrift", 15)
+        self.heading_font = pygame.font.SysFont("segoe ui", 22)
         self.title_font = pygame.font.SysFont("cambria", 32, bold=True)
         clock = pygame.time.Clock()
         self._running = True
@@ -1182,7 +1379,7 @@ class LabControlApp:
     def _advanced_tab_sections(self, rect: pygame.Rect) -> dict[str, pygame.Rect]:
         gap = 14
         control_height = 172
-        status_height = 196
+        status_height = 248
         control_rect = pygame.Rect(rect.x, rect.y, rect.width, control_height)
         status_top = control_rect.bottom + gap
         status_rect = pygame.Rect(rect.x, status_top, rect.width, status_height)
@@ -1392,26 +1589,6 @@ class LabControlApp:
         pygame.draw.rect(screen, SURFACE_CARD, inner, border_radius=24)
         state = self.controller.render_state()
         if state is None or not state.get("grid"):
-            title = self.title_font.render("Seed Ladder Ready", True, TEXT_PRIMARY)
-            screen.blit(title, (self.game_area.x + 30, self.game_area.y + 30))
-            subtitle = self.font.render(
-                "Play starts at the chosen seed, advances on every win, and trains the first maze that beats the policy.",
-                True,
-                TEXT_SECONDARY,
-            )
-            screen.blit(subtitle, (self.game_area.x + 30, self.game_area.y + 72))
-            tip_lines = [
-                "Use the basic tab for the production flow: set a start seed and a train count, then let the app work.",
-                "Review and Advanced keep replay, comparison, and checkpoint controls available without crowding the main surface.",
-            ]
-            self._draw_wrapped_text(
-                screen,
-                self.heading_font,
-                tip_lines,
-                TEXT_SECONDARY,
-                pygame.Rect(self.game_area.x + 30, self.game_area.y + 146, self.game_area.width - 60, 120),
-                line_gap=8,
-            )
             return
 
         grid = viewer_grid(state)
@@ -1537,7 +1714,16 @@ class LabControlApp:
 
         self._draw_card(screen, status_rect, "Status")
         status_body = self._card_body_rect(status_rect)
-        self._draw_wrapped_text(screen, self.font, self.controller.primary_status_lines(), (56, 64, 76), status_body, line_gap=4)
+        self._draw_segment_lines(
+            screen,
+            self.controller.primary_status_segments(),
+            status_body,
+            self.font,
+            self.font_bold,
+            TEXT_MUTED,
+            TEXT_PRIMARY,
+            line_gap=6,
+        )
 
     def _draw_review_tab(self, screen: Any, rect: pygame.Rect) -> None:
         sections = self._review_tab_sections(rect)
@@ -1608,21 +1794,35 @@ class LabControlApp:
             card_rect = pygame.Rect(rect.x + 14 + index * (card_width + gap), top, card_width, 58)
             pygame.draw.rect(screen, SURFACE_CARD_ALT, card_rect, border_radius=16)
             pygame.draw.rect(screen, BORDER, card_rect, width=1, border_radius=16)
-            title = self.small_font.render(card.label, True, TEXT_SECONDARY)
+            title = self.small_font.render(card.label, True, TEXT_MUTED)
             screen.blit(title, (card_rect.x + 10, card_rect.y + 4))
             percentage = self.heading_font.render(f"{card.percentage * 100:.0f}%", True, TEXT_PRIMARY)
             screen.blit(percentage, (card_rect.x + 10, card_rect.y + 18))
-            summary = self.small_font.render(f"{card.cycles} seeds | {card.wins}W {card.losses}L", True, TEXT_SECONDARY)
-            screen.blit(summary, (card_rect.x + 10, card_rect.y + 40))
+            self._draw_segment_line(
+                screen,
+                [
+                    (str(card.cycles), False),
+                    (" seeds | ", False),
+                    (str(card.wins), False),
+                    ("W ", False),
+                    (str(card.losses), False),
+                    ("L", False),
+                ],
+                (card_rect.x + 10, card_rect.y + 40),
+                self.small_font,
+                self.small_font_bold,
+                TEXT_MUTED,
+                TEXT_PRIMARY,
+            )
 
     def _draw_basic_training_summary(self, screen: Any, rect: pygame.Rect) -> None:
         """Draw the ladder win-rate windows and recent seed outcomes."""
 
         card = self.controller.all_time_training_card()
         body_rect = self._card_body_rect(rect)
-        label_color = TEXT_SECONDARY
+        label_color = TEXT_MUTED
         value_color = TEXT_PRIMARY
-        labels = ["All runs", "Wins", "Losses", "Win %"]
+        labels = [card.label, "Wins", "Losses", "Win %"]
         values = [str(card.cycles), str(card.wins), str(card.losses), f"{card.percentage * 100:.0f}%"]
         column_width = (rect.width - 28) // 4
         for index, (label, value) in enumerate(zip(labels, values, strict=True)):
@@ -1642,7 +1842,7 @@ class LabControlApp:
             symbols = " ".join("W" if item == "escaped" else "L" for item in recent)
             recent_surface = self.small_font.render(symbols, True, value_color)
         else:
-            recent_surface = self.small_font.render("No completed seeds yet", True, value_color)
+            recent_surface = self.small_font.render("No completed seeds yet", True, TEXT_MUTED)
         screen.blit(recent_surface, (body_rect.x + 60, recent_y))
 
     def _draw_training_progress(self, screen: Any, rect: pygame.Rect) -> None:
@@ -1683,12 +1883,57 @@ class LabControlApp:
         screen.blit(hint_surface, (body_rect.x, body_rect.y + 42))
 
     def _draw_input(self, screen: Any, rect: pygame.Rect, label: str, value: str, active: bool) -> None:
-        label_surface = self.small_font.render(label, True, TEXT_SECONDARY)
+        label_surface = self.small_font.render(label, True, TEXT_MUTED)
         screen.blit(label_surface, (rect.x, rect.y - 18))
         pygame.draw.rect(screen, SURFACE_CARD, rect, border_radius=10)
         pygame.draw.rect(screen, PRIMARY if active else BORDER, rect, width=2 if active else 1, border_radius=10)
         value_surface = self.font.render(value or "", True, TEXT_PRIMARY)
         screen.blit(value_surface, (rect.x + 10, rect.y + 5))
+
+    @staticmethod
+    def _draw_segment_line(
+        screen: Any,
+        segments: list[tuple[str, bool]],
+        position: tuple[int, int],
+        regular_font: Any,
+        bold_font: Any,
+        regular_color: tuple[int, int, int],
+        bold_color: tuple[int, int, int],
+    ) -> None:
+        draw_x, draw_y = position
+        for text, is_bold in segments:
+            if not text:
+                continue
+            font = bold_font if is_bold else regular_font
+            color = bold_color if is_bold else regular_color
+            surface = font.render(text, True, color)
+            screen.blit(surface, (draw_x, draw_y))
+            draw_x += surface.get_width()
+
+    def _draw_segment_lines(
+        self,
+        screen: Any,
+        lines: list[list[tuple[str, bool]]],
+        rect: pygame.Rect,
+        regular_font: Any,
+        bold_font: Any,
+        regular_color: tuple[int, int, int],
+        bold_color: tuple[int, int, int],
+        line_gap: int,
+    ) -> None:
+        draw_y = rect.y
+        line_height = max(regular_font.get_height(), bold_font.get_height()) + line_gap
+        for segments in lines:
+            self._draw_segment_line(
+                screen,
+                segments,
+                (rect.x, draw_y),
+                regular_font,
+                bold_font,
+                regular_color,
+                bold_color,
+            )
+            draw_y += line_height
 
     def _draw_button(self, screen: Any, button: Button) -> None:
         if button.kind == "tab":
