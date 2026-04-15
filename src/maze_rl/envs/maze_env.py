@@ -334,7 +334,7 @@ class MazeEnv(gym.Env[np.ndarray, int]):
         micro_steps: list[ReplayMicroStep] = []
         capture_event: dict[str, Any] | None = None
 
-        from maze_rl.training.showcase import rank_legal_moves
+        from maze_rl.policies.action_helpers import rank_legal_moves
 
         ranked_moves = rank_legal_moves(self)
         if ranked_moves:
@@ -698,14 +698,14 @@ class MazeEnv(gym.Env[np.ndarray, int]):
 
         if self.player is None:
             return [True] * int(self.action_space.n)
-        from maze_rl.training.showcase import _project_action_target, describe_move_choice, rank_legal_moves, should_override_policy
+        from maze_rl.policies.action_helpers import describe_move_choice, project_action_target, rank_legal_moves, should_override_policy
 
         masks: list[bool] = []
         for action in range(int(self.action_space.n)):
             if action == self.wait_action_index:
                 masks.append(False)
                 continue
-            _first_step_target, _target, completed_full_speed = _project_action_target(self, action)
+            _first_step_target, _target, completed_full_speed = project_action_target(self, action)
             masks.append(completed_full_speed)
         ranked_moves = rank_legal_moves(self)
         best_move = ranked_moves[0] if ranked_moves else None
