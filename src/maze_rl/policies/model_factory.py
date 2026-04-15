@@ -1,59 +1,107 @@
-"""Model creation and loading helpers."""
+"""Registry-based model creation, loading, and prediction.
+
+All algorithm-specific logic lives in :mod:`maze_rl.policies.backends`.
+This module provides a backend **registry** and thin convenience wrappers
+so callers don't need to pick a backend class themselves.
+"""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-from sb3_contrib import MaskablePPO, RecurrentPPO
-from stable_baselines3 import PPO
 
 from maze_rl.config import TrainingConfig
+from maze_rl.policies.agent_interface import AgentBackend
+
+
+# ---------------------------------------------------------------------------
+# Registry
+# ---------------------------------------------------------------------------
+
+_REGISTRY: dict[str, AgentBackend] = {}
+
+
+def register_backend(backend: AgentBackend) -> None:
+    """Register a backend instance under its ``algorithm_name``."""
+
+    _REGISTRY[backend.algorithm_name] = backend
+
+
+def get_backend(algorithm: str) -> AgentBackend:
+    """Look up a registered backend by algorithm name."""
+
+    _ensure_builtins()
+    try:
+        return _REGISTRY[algorithm]
+    except KeyError as exc:
+        available = ", ".join(sorted(_REGISTRY)) or "(none)"
+        raise ValueError(
+            f"Unknown algorithm {algorithm!r}. Registered backends: {available}"
+        ) from exc
+
+
+def available_backends() -> list[str]:
+    """Return sorted names of all registered backends."""
+
+    _ensure_builtins()
+    return sorted(_REGISTRY)
+
+
+_BUILTINS_REGISTERED = False
+
+
+def _ensure_builtins() -> None:
+    """Lazily register the three built-in backends on first access."""
+
+    global _BUILTINS_REGISTERED  # noqa: PLW0603
+    if _BUILTINS_REGISTERED:
+        return
+    _BUILTINS_REGISTERED = True
+
+    from maze_rl.policies.backends import (
+        MaskablePPOBackend,
+        PPOBackend,
+        RecurrentPPOBackend,
+    )
+
+    for backend in (PPOBackend(), MaskablePPOBackend(), RecurrentPPOBackend()):
+        if backend.algorithm_name not in _REGISTRY:
+            register_backend(backend)
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint compatibility error (kept here for backward-compat imports)
+# ---------------------------------------------------------------------------
 
 
 class CheckpointCompatibilityError(ValueError):
     """Raised when a saved checkpoint no longer matches the current environment."""
 
 
-def create_model(training_config: TrainingConfig, env: Any) -> Any:
-    """Create the requested SB3 model."""
+# ---------------------------------------------------------------------------
+# Convenience wrappers — same signatures as the old API
+# ---------------------------------------------------------------------------
 
-    common_kwargs = {
-        "env": env,
-        "seed": training_config.seed,
-        "learning_rate": training_config.learning_rate,
-        "gamma": training_config.gamma,
-        "n_steps": training_config.n_steps,
-        "batch_size": training_config.batch_size,
-        "ent_coef": training_config.ent_coef,
-        "verbose": 0,
-        "device": "cpu",
-    }
-    if training_config.algorithm == "maskable_ppo":
-        return MaskablePPO("MlpPolicy", **common_kwargs)
-    if training_config.algorithm == "ppo":
-        return PPO("MlpPolicy", **common_kwargs)
-    if training_config.algorithm == "recurrent_ppo":
-        return RecurrentPPO("MlpLstmPolicy", **common_kwargs)
-    raise ValueError(f"Unsupported algorithm: {training_config.algorithm}")
+
+def create_model(training_config: TrainingConfig, env: Any) -> Any:
+    """Create a fresh model via the registered backend for *training_config.algorithm*."""
+
+    backend = get_backend(training_config.algorithm)
+    return backend.create_model(training_config, env)
 
 
 def load_model_from_checkpoint(checkpoint_path: str | Path, env: Any) -> Any:
-    """Load a checkpoint zip with the correct algorithm class."""
-
-    import json
+    """Load a checkpoint zip using the algorithm recorded in its sidecar JSON."""
 
     metadata_path = Path(checkpoint_path).with_suffix(".json")
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     algorithm = metadata["algorithm"]
+    backend = get_backend(algorithm)
     try:
-        if algorithm == "maskable_ppo":
-            return MaskablePPO.load(str(checkpoint_path), env=env, device="cpu")
-        if algorithm == "ppo":
-            return PPO.load(str(checkpoint_path), env=env, device="cpu")
-        if algorithm == "recurrent_ppo":
-            return RecurrentPPO.load(str(checkpoint_path), env=env, device="cpu")
+        return backend.load_model(checkpoint_path, env)
     except ValueError as error:
         message = str(error)
         if "spaces do not match" in message:
@@ -64,7 +112,6 @@ def load_model_from_checkpoint(checkpoint_path: str | Path, env: Any) -> Any:
                 f"checkpoint={checkpoint_path} | details={message}"
             ) from error
         raise
-    raise ValueError(f"Unsupported algorithm in metadata: {algorithm}")
 
 
 def predict_action(
@@ -75,46 +122,50 @@ def predict_action(
     episode_start: np.ndarray | None = None,
     action_masks: np.ndarray | None = None,
 ) -> tuple[int, Any]:
-    """Predict an action for PPO or RecurrentPPO."""
+    """Predict an action using the backend that matches the model's class."""
 
-    if model.__class__.__name__ == "RecurrentPPO":
-        action, recurrent_state = model.predict(
-            observation,
-            state=recurrent_state,
-            episode_start=episode_start,
-            deterministic=deterministic,
+    backend = _backend_for_model(model)
+    return backend.predict(
+        model,
+        observation,
+        deterministic,
+        recurrent_state=recurrent_state,
+        episode_start=episode_start,
+        action_masks=action_masks,
+    )
+
+
+def action_probabilities(
+    model: Any,
+    observation: np.ndarray,
+    action_masks: np.ndarray | None = None,
+) -> np.ndarray | None:
+    """Return per-action probabilities via the model's backend."""
+
+    backend = _backend_for_model(model)
+    return backend.action_probabilities(model, observation, action_masks=action_masks)
+
+
+# ---------------------------------------------------------------------------
+# Internal helper
+# ---------------------------------------------------------------------------
+
+# Maps SB3 class name → algorithm name for reverse lookup during prediction.
+_CLASS_TO_ALGORITHM: dict[str, str] = {
+    "PPO": "ppo",
+    "MaskablePPO": "maskable_ppo",
+    "RecurrentPPO": "recurrent_ppo",
+}
+
+
+def _backend_for_model(model: Any) -> AgentBackend:
+    """Resolve the backend that created or can handle *model*."""
+
+    class_name = model.__class__.__name__
+    algorithm = _CLASS_TO_ALGORITHM.get(class_name)
+    if algorithm is None:
+        raise ValueError(
+            f"Cannot determine backend for model class {class_name!r}. "
+            "Register a backend or use the backend directly."
         )
-        return int(action), recurrent_state
-    if model.__class__.__name__ == "MaskablePPO":
-        action, recurrent_state = model.predict(observation, deterministic=deterministic, action_masks=action_masks)
-        return int(action), recurrent_state
-    action, recurrent_state = model.predict(observation, deterministic=deterministic)
-    return int(action), recurrent_state
-
-
-def action_probabilities(model: Any, observation: np.ndarray, action_masks: np.ndarray | None = None) -> np.ndarray | None:
-    """Return action probabilities when the model exposes a policy distribution."""
-
-    policy = getattr(model, "policy", None)
-    if policy is None or not hasattr(policy, "obs_to_tensor") or not hasattr(policy, "get_distribution"):
-        return None
-    try:
-        obs_tensor, _ = policy.obs_to_tensor(observation)
-        try:
-            distribution = policy.get_distribution(obs_tensor, action_masks=action_masks)
-        except TypeError:
-            distribution = policy.get_distribution(obs_tensor)
-        base_distribution = getattr(distribution, "distribution", distribution)
-        probabilities = getattr(base_distribution, "probs", None)
-        if probabilities is None:
-            return None
-        values = np.asarray(probabilities.detach().cpu().numpy()).reshape(-1)
-        if action_masks is not None and values.shape == action_masks.shape:
-            values = values.copy()
-            values[~action_masks] = 0.0
-            total = float(values.sum())
-            if total > 0.0:
-                values /= total
-        return values
-    except (AttributeError, RuntimeError, TypeError, ValueError):
-        return None
+    return get_backend(algorithm)
