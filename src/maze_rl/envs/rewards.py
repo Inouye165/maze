@@ -18,6 +18,7 @@ class StepEvent:
     oscillations: int
     oscillation_severity: int
     dead_end_entries: int
+    deeper_dead_end_entries: int
     avoidable_visible_dead_end_entries: int
     trap_threat_entries: int
     blocked_moves: int
@@ -38,6 +39,7 @@ class RewardBreakdown:
     revisit: float
     oscillation: float
     dead_end: float
+    deeper_dead_end: float
     avoidable_visible_dead_end: float
     trap_threat: float
     blocking: float
@@ -54,6 +56,7 @@ def compute_reward(config: RewardConfig, event: StepEvent) -> RewardBreakdown:
     revisit = config.revisit_penalty * event.revisits + config.revisit_depth_penalty * event.revisit_depth
     oscillation = config.oscillation_penalty * event.oscillation_severity * event.oscillations
     dead_end = config.dead_end_penalty * event.dead_end_entries
+    deeper_dead_end = config.deeper_dead_end_penalty * event.deeper_dead_end_entries
     avoidable_visible_dead_end = (
         config.avoidable_visible_dead_end_penalty * event.avoidable_visible_dead_end_entries
     )
@@ -83,6 +86,7 @@ def compute_reward(config: RewardConfig, event: StepEvent) -> RewardBreakdown:
         + revisit
         + oscillation
         + dead_end
+        + deeper_dead_end
         + avoidable_visible_dead_end
         + trap_threat
         + blocking
@@ -97,6 +101,7 @@ def compute_reward(config: RewardConfig, event: StepEvent) -> RewardBreakdown:
         revisit=revisit,
         oscillation=oscillation,
         dead_end=dead_end,
+        deeper_dead_end=deeper_dead_end,
         avoidable_visible_dead_end=avoidable_visible_dead_end,
         trap_threat=trap_threat,
         blocking=blocking,

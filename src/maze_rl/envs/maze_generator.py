@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from collections import deque
+from functools import lru_cache
 from random import Random
 
 from .entities import MazeLayout, Position
 
 
 DIRECTION_DELTAS = [(-1, 0), (0, 1), (1, 0), (0, -1)]
+MAX_GENERATION_ATTEMPTS = 20
 
 
 def _ensure_odd(value: int) -> int:
@@ -84,11 +86,12 @@ def _bfs_distances(grid: tuple[str, ...], start: Position) -> dict[Position, int
     return distances
 
 
+@lru_cache(maxsize=16_384)
 def _shortest_path(
     grid: tuple[str, ...],
     start: Position,
     goal: Position,
-) -> list[Position]:
+) -> tuple[Position, ...]:
     """Return the shortest path between two open cells."""
 
     parents: dict[Position, Position | None] = {start: None}
@@ -106,14 +109,14 @@ def _shortest_path(
             parents[candidate] = current
             queue.append(candidate)
     if goal not in parents:
-        return [start]
+        return (start,)
     path: list[Position] = []
     node: Position | None = goal
     while node is not None:
         path.append(node)
         node = parents[node]
     path.reverse()
-    return path
+    return tuple(path)
 
 
 def _has_line_of_sight(
@@ -217,7 +220,7 @@ def _simulate_turn(
 
 
 def _path_segment(
-    path: list[Position],
+    path: tuple[Position, ...],
     start_index: int,
     max_player_speed: int,
 ) -> tuple[int, int, int]:
@@ -331,11 +334,13 @@ def _choose_exit_and_monster(
         ]
         fallback_monsters = [position for position in open_positions if position != exit_position]
 
-        def _score_visible_monster(position: Position) -> tuple[int, int]:
+        def _score_visible_monster(
+            position: Position,
+            anchor: Position = exit_position,
+        ) -> tuple[int, int]:
             return (
                 distances_from_start.get(position, 0),
-                abs(position.row - exit_position.row)
-                + abs(position.col - exit_position.col),
+                abs(position.row - anchor.row) + abs(position.col - anchor.col),
             )
 
         candidate_groups = [
@@ -409,7 +414,9 @@ def generate_maze(
     rows = max(5, _ensure_odd(rows))
     cols = max(5, _ensure_odd(cols))
     start = Position(1, 1)
-    for attempt in range(12):
+    # Same-cell capture is stricter than earlier dodge-based rules, so some
+    # deterministic layouts that used to be accepted now need extra retries.
+    for attempt in range(MAX_GENERATION_ATTEMPTS):
         attempt_seed = seed + attempt * 104_729
         rng = Random(attempt_seed)
         grid = [["#" for _ in range(cols)] for _ in range(rows)]

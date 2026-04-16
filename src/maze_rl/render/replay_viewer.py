@@ -12,6 +12,7 @@ import pygame
 from maze_rl.render.view_state import (
     viewer_cell_color,
     viewer_dead_end_cells,
+    viewer_exit_color,
     viewer_explored_cells,
     viewer_exit_position,
     viewer_grid,
@@ -235,7 +236,7 @@ class ReplayViewer:
                     pygame.draw.rect(screen, color, rect)
 
             entities: list[tuple[tuple[int, int] | None, tuple[int, int, int]]] = [
-                (viewer_exit_position(state), (70, 180, 90)),
+                (viewer_exit_position(state), viewer_exit_color(state)),
             ]
             if state.get("player_visible", True):
                 entities.append((viewer_player_position(state), (60, 110, 220)))

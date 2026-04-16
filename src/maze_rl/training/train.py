@@ -393,10 +393,11 @@ def maze_config_for_training_mode(maze_config: MazeConfig, training_mode: str) -
         revisit_penalty=-0.6,
         revisit_depth_penalty=-0.2,
         oscillation_penalty=-1.5,
-        dead_end_penalty=-0.45,
+        dead_end_penalty=-0.9,
+        deeper_dead_end_penalty=-1.35,
         # Keep this below exploration and exit progress so PPO still has to trade off,
         # but make avoidable visible dead ends costly enough to learn before contact.
-        avoidable_visible_dead_end_penalty=-0.8,
+        avoidable_visible_dead_end_penalty=-1.05,
         trap_threat_penalty=-12.0,
         blocked_move_penalty=-2.0,
         exit_progress_reward=1.6,

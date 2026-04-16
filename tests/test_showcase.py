@@ -162,6 +162,49 @@ def test_heuristic_runs_from_visible_monster_when_exit_path_is_not_safe() -> Non
     assert best.monster_distance_gain > 0
 
 
+def test_heuristic_commits_to_seen_exit_when_monster_loses_exit_race() -> None:
+    """Once the human can see a safe exit route, the heuristic should commit to it."""
+
+    env = MazeEnv(
+        MazeConfig(
+            rows=5,
+            cols=7,
+            vision_range=4,
+            max_player_speed=1,
+            monster_speed=1,
+            monster_activation_delay=0,
+            curriculum_enabled=False,
+        ),
+        training_mode=False,
+    )
+    layout = MazeLayout(
+        grid=(
+            "#######",
+            "#.....#",
+            "#.....#",
+            "#######",
+        ),
+        player_start=Position(1, 3),
+        monster_start=Position(1, 1),
+        exit_position=Position(1, 5),
+        seed=141,
+    )
+    env.reset(seed=141, options={"layout": layout, "maze_seed": 141})
+    env.visited_counts = {
+        Position(1, 3): 2,
+        Position(1, 4): 1,
+        Position(2, 3): 0,
+    }
+
+    best = rank_legal_moves(env)[0]
+    chosen = describe_move_choice(env, 2)
+
+    assert best.target == Position(1, 4)
+    assert best.commit_to_exit is True
+    assert chosen is not None
+    assert should_override_policy(chosen, best, chosen_confidence=0.30, confidence_gap=0.02) is True
+
+
 def test_heuristic_runs_away_when_monster_enters_extended_corridor_visibility() -> None:
     """The heuristic should flee when the monster appears at the edge of corridor vision."""
 
@@ -264,6 +307,92 @@ def test_heuristic_avoids_reentering_mapped_branchy_dead_region() -> None:
     assert best.target == Position(3, 5)
     assert west.known_dead_end is True
     assert east.known_dead_end is False
+
+
+def test_heuristic_exits_active_dead_end_section_before_exploring_inside_it() -> None:
+    """Once trapped inside a marked section, the heuristic should head for the exit path first."""
+
+    env = MazeEnv(
+        MazeConfig(
+            rows=7,
+            cols=9,
+            vision_range=4,
+            max_player_speed=1,
+            monster_speed=0,
+            monster_activation_delay=999,
+            curriculum_enabled=False,
+        ),
+        training_mode=False,
+    )
+    layout = MazeLayout(
+        grid=(
+            "#########",
+            "#########",
+            "##....###",
+            "####.####",
+            "####.####",
+            "####...##",
+            "#########",
+        ),
+        player_start=Position(2, 4),
+        monster_start=Position(5, 6),
+        exit_position=Position(5, 6),
+        seed=144,
+    )
+    env.reset(seed=144, options={"layout": layout, "maze_seed": 144})
+    env.player = Position(2, 4)
+    env.seen_open_cells = {
+        Position(2, 2),
+        Position(2, 4),
+        Position(2, 3),
+        Position(2, 5),
+        Position(2, 4),
+        Position(2, 3),
+        Position(3, 4),
+        Position(4, 4),
+        Position(5, 4),
+        Position(5, 5),
+        Position(5, 6),
+    }
+    env.visible_open_cells = {
+        Position(2, 2),
+        Position(2, 3),
+        Position(2, 4),
+        Position(2, 5),
+        Position(3, 4),
+        Position(4, 4),
+        Position(5, 4),
+        Position(5, 5),
+    }
+    env.discovered_cells = len(env.seen_open_cells)
+    env.path_history = deque([Position(3, 4), Position(2, 4)], maxlen=6)
+    env.visited_counts = {
+        Position(2, 4): 2,
+        Position(3, 4): 2,
+        Position(4, 4): 1,
+        Position(5, 4): 1,
+    }
+    env.known_dead_end_cells = {
+        Position(2, 2),
+        Position(2, 4),
+        Position(2, 3),
+        Position(2, 5),
+        Position(3, 4),
+        Position(4, 4),
+        Position(5, 4),
+        Position(5, 5),
+    }
+
+    ranked = rank_legal_moves(env)
+    best = ranked[0]
+    action = choose_heuristic_action(env)
+    choice = describe_move_choice(env, action)
+
+    assert best.target == Position(3, 4)
+    assert action == 2
+    assert choice is not None
+    assert choice.escaping_dead_end is True
+    assert choice.known_dead_end is False
 
 
 def test_heuristic_does_not_use_hidden_monster_position_without_memory() -> None:
@@ -626,3 +755,140 @@ def test_run_checkpoint_showcase_episode_returns_incompatible_result(monkeypatch
     assert result.status == "incompatible"
     assert result.outcome == "incompatible"
     assert "Observation spaces do not match" in result.notes
+
+
+def test_fear_mode_avoids_dead_end_even_when_it_gains_monster_distance() -> None:
+    """In fear mode a dead-end corridor that increases monster distance must not be
+    preferred over a safe alternative, because the monster will corner the agent."""
+
+    env = MazeEnv(
+        MazeConfig(
+            rows=5,
+            cols=8,
+            vision_range=4,
+            max_player_speed=1,
+            monster_speed=1,
+            monster_activation_delay=0,
+            curriculum_enabled=False,
+        ),
+        training_mode=False,
+    )
+    #   01234567
+    # 0 ###.####   dead-end pocket at (0,3)
+    # 1 #......#   main corridor
+    # 2 #.####.#   walls; connectors at (2,1) and (2,6)
+    # 3 #......#   south corridor leading to exit
+    # 4 ########
+    layout = MazeLayout(
+        grid=(
+            "###.####",
+            "#......#",
+            "#.####.#",
+            "#......#",
+            "########",
+        ),
+        player_start=Position(1, 3),
+        monster_start=Position(1, 5),
+        exit_position=Position(3, 6),
+        seed=180,
+    )
+    env.reset(seed=180, options={"layout": layout, "maze_seed": 180})
+
+    # Player at junction (1,3); monster visible at (1,5) — fear mode.
+    env.player = Position(1, 3)
+    env.monster = Position(1, 5)
+    env.seen_open_cells = {
+        Position(0, 3),
+        Position(1, 1), Position(1, 2), Position(1, 3),
+        Position(1, 4), Position(1, 5), Position(1, 6),
+        Position(2, 1), Position(2, 6),
+        Position(3, 1), Position(3, 2), Position(3, 3),
+        Position(3, 4), Position(3, 5), Position(3, 6),
+    }
+    env.visible_open_cells = {
+        Position(0, 3),
+        Position(1, 1), Position(1, 2), Position(1, 3),
+        Position(1, 4), Position(1, 5), Position(1, 6),
+    }
+    env.visited_counts = {Position(1, 3): 1}
+    # (0,3) is a dead-end tip; routes through it from (1,3) commit to a dead end.
+    env.known_dead_end_cells = {Position(0, 3)}
+    env.path_history = deque([Position(1, 4), Position(1, 3)], maxlen=6)
+    env.turns_since_monster_seen = 0
+    env.last_seen_monster_position = Position(1, 5)
+
+    ranked = rank_legal_moves(env)
+    best = ranked[0]
+
+    # The best choice must NOT be into the dead-end pocket (north to (0,3)).
+    assert not best.known_dead_end, (
+        f"Fear-mode heuristic chose dead-end cell {best.target} over safe alternatives"
+    )
+    assert not best.enters_dead_end, (
+        f"Fear-mode heuristic entered a dead-end tip at {best.target}"
+    )
+
+
+def test_override_catches_policy_choosing_dead_end_over_safe_move() -> None:
+    """The safety override should replace a trained-policy dead-end choice."""
+
+    env = MazeEnv(
+        MazeConfig(
+            rows=5,
+            cols=7,
+            vision_range=4,
+            max_player_speed=1,
+            monster_speed=1,
+            monster_activation_delay=0,
+            curriculum_enabled=False,
+        ),
+        training_mode=False,
+    )
+    #   0123456
+    # 0 #######
+    # 1 #.....#   corridor; (1,1)-(1,2) are a dead-end pocket
+    # 2 #####.#   walls block south; only (2,5) open
+    # 3 #.....#   south corridor
+    # 4 #######
+    layout = MazeLayout(
+        grid=(
+            "#######",
+            "#.....#",
+            "#####.#",
+            "#.....#",
+            "#######",
+        ),
+        player_start=Position(1, 3),
+        monster_start=Position(3, 3),
+        exit_position=Position(1, 5),
+        seed=181,
+    )
+    env.reset(seed=181, options={"layout": layout, "maze_seed": 181})
+    env.player = Position(1, 3)
+    env.monster = Position(3, 3)
+    env.seen_open_cells = {
+        Position(1, 1), Position(1, 2), Position(1, 3),
+        Position(1, 4), Position(1, 5),
+        Position(2, 5),
+        Position(3, 3), Position(3, 4), Position(3, 5),
+    }
+    env.visible_open_cells = {
+        Position(1, 1), Position(1, 2), Position(1, 3),
+        Position(1, 4), Position(1, 5),
+    }
+    env.visited_counts = {Position(1, 3): 1}
+    env.known_dead_end_cells = {Position(1, 1), Position(1, 2)}
+    env.path_history = deque([Position(1, 4), Position(1, 3)], maxlen=6)
+
+    # Simulate policy choosing direction 3 (west → dead end at (1,2))
+    dead_end_action = 3  # west
+    safe_action = 1  # east → (1,4), not a dead end
+    chosen = describe_move_choice(env, dead_end_action)
+    best = describe_move_choice(env, safe_action)
+
+    from maze_rl.policies.action_helpers import should_override_policy
+    assert chosen is not None
+    assert best is not None
+    assert chosen.known_dead_end is True
+    assert best.known_dead_end is False
+    assert should_override_policy(chosen, best, 0.6, 0.3) is True

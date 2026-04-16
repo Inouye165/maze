@@ -226,7 +226,7 @@ def test_action_masks_force_fastest_escape_speed_when_visible_monster_has_clear_
 
 
 def test_episode_reports_avoidable_capture_when_clear_escape_was_ignored() -> None:
-    """Caught episodes should be flagged when the pre-step state had a clear escape."""
+    """Stepping directly into the monster should be rejected as an illegal move."""
 
     env = MazeEnv(
         MazeConfig(
@@ -255,9 +255,11 @@ def test_episode_reports_avoidable_capture_when_clear_escape_was_ignored() -> No
 
     _, _, terminated, truncated, info = env.step(1)
 
-    assert terminated is True
+    assert terminated is False
     assert truncated is False
-    assert info["outcome"] == "caught"
+    assert info["outcome"] == "running"
+    assert info["blocked_moves"] == 1
+    assert info["state_snapshot"]["player_position"] == (1, 3)
 
 
 def test_no_progress_allows_turns_that_shorten_known_exit_path() -> None:
@@ -537,8 +539,8 @@ def test_last_seen_monster_position_persists_after_rounding_corner() -> None:
     assert after["turns_since_monster_seen"] == 1
 
 
-def test_player_survives_perpendicular_monster_at_t_intersection() -> None:
-    """A monster rounding through a T intersection should not cause an unavoidable surprise loss."""
+def test_player_is_caught_when_monster_reaches_same_junction_cell() -> None:
+    """Once the monster reaches the player's cell, the turn ends in capture."""
 
     layout = MazeLayout(
         grid=(
@@ -564,18 +566,18 @@ def test_player_survives_perpendicular_monster_at_t_intersection() -> None:
     _observation, _reward, terminated, truncated, info = env.step(0)
     masks = env.action_masks()
 
-    assert terminated is False
+    assert terminated is True
     assert truncated is False
-    assert info["outcome"] == "running"
+    assert info["outcome"] == "caught"
     assert info["state_snapshot"]["player_position"] == (3, 3)
-    assert info["state_snapshot"]["monster_position"] == (3, 2)
+    assert info["state_snapshot"]["monster_position"] == (3, 3)
     assert info["state_snapshot"]["monster_visible"] is True
     assert masks[3] is False
     assert any(masks[index] for index in (1, 2))
 
 
-def test_head_on_corridor_collision_triggers_reactive_dodge() -> None:
-    """In a corridor the player dodges back and never swaps through the monster."""
+def test_head_on_corridor_collision_is_immediate_capture() -> None:
+    """In a corridor, contact with the monster ends the turn immediately."""
 
     layout = MazeLayout(
         grid=(
@@ -596,12 +598,45 @@ def test_head_on_corridor_collision_triggers_reactive_dodge() -> None:
 
     _observation, _reward, terminated, truncated, info = env.step(1)
 
-    # Reactive dodge: player escapes, not caught
-    assert terminated is False
+    assert terminated is True
     assert truncated is False
-    assert info["outcome"] == "running"
-    assert env.player == Position(1, 2)
+    assert info["outcome"] == "caught"
+    assert env.player == Position(1, 3)
     assert env.monster == Position(1, 3)
+
+
+def test_action_masks_block_moving_into_visible_monster_cell() -> None:
+    """The human should never be allowed to step directly into the monster's cell."""
+
+    env = MazeEnv(
+        MazeConfig(
+            rows=3,
+            cols=7,
+            vision_range=4,
+            max_player_speed=1,
+            monster_speed=0,
+            monster_activation_delay=999,
+            curriculum_enabled=False,
+        ),
+        training_mode=True,
+    )
+    layout = MazeLayout(
+        grid=(
+            "#######",
+            "#.....#",
+            "#######",
+        ),
+        player_start=Position(1, 2),
+        monster_start=Position(1, 3),
+        exit_position=Position(1, 5),
+        seed=660,
+    )
+    env.reset(options={"layout": layout, "maze_seed": 660})
+
+    masks = env.action_masks()
+
+    assert env.get_state_snapshot()["monster_visible"] is True
+    assert masks[1] is False
 
 
 def test_trapped_in_dead_end_still_caught() -> None:
@@ -1016,6 +1051,111 @@ def test_visible_dead_end_penalty_is_skipped_when_it_is_only_legal_move() -> Non
     assert info["step_visible_dead_end_opportunity"] is False
     assert info["step_entered_visible_dead_end"] is True
     assert info["avoidable_visible_dead_end_penalties_applied"] == 0
+
+
+def test_known_dead_end_commit_applies_stronger_deeper_penalty() -> None:
+    """Moving deeper into a remembered dead route should incur the extra penalty."""
+
+    env = MazeEnv(
+        MazeConfig(
+            rows=4,
+            cols=7,
+            vision_range=4,
+            max_player_speed=1,
+            monster_speed=0,
+            monster_activation_delay=999,
+            curriculum_enabled=False,
+        ),
+        training_mode=False,
+    )
+    layout = MazeLayout(
+        grid=(
+            "#######",
+            "#.....#",
+            "#######",
+        ),
+        player_start=Position(1, 2),
+        monster_start=Position(1, 1),
+        exit_position=Position(1, 1),
+        seed=160,
+    )
+    env.reset(seed=160, options={"layout": layout, "maze_seed": 160})
+    env.player = Position(1, 2)
+    env.visited_counts = {Position(1, 1): 1, Position(1, 2): 1, Position(1, 3): 0}
+    env.seen_open_cells = {
+        Position(1, 1),
+        Position(1, 2),
+        Position(1, 3),
+        Position(1, 4),
+        Position(1, 5),
+    }
+    env.visible_open_cells = set(env.seen_open_cells)
+    env.known_dead_end_cells = {Position(1, 3), Position(1, 4), Position(1, 5)}
+
+    _observation, _reward, terminated, truncated, info = env.step(1)
+
+    assert terminated is False
+    assert truncated is False
+    assert info["dead_end_entries"] == 1
+    assert info["deeper_dead_end_entries"] == 1
+    assert info["step_deeper_dead_end_entry"] is True
+    assert info["reward_breakdown"].dead_end < 0.0
+    assert info["reward_breakdown"].deeper_dead_end < 0.0
+
+
+def test_backtracking_toward_opening_is_not_penalized_as_dead_end_commit() -> None:
+    """Moving out of a remembered dead route should not incur dead-end penalties."""
+
+    env = MazeEnv(
+        MazeConfig(
+            rows=4,
+            cols=7,
+            vision_range=4,
+            max_player_speed=1,
+            monster_speed=0,
+            monster_activation_delay=999,
+            curriculum_enabled=False,
+        ),
+        training_mode=False,
+    )
+    layout = MazeLayout(
+        grid=(
+            "#######",
+            "#.....#",
+            "#######",
+        ),
+        player_start=Position(1, 4),
+        monster_start=Position(1, 1),
+        exit_position=Position(1, 1),
+        seed=161,
+    )
+    env.reset(seed=161, options={"layout": layout, "maze_seed": 161})
+    env.player = Position(1, 4)
+    env.visited_counts = {
+        Position(1, 1): 1,
+        Position(1, 2): 1,
+        Position(1, 3): 1,
+        Position(1, 4): 1,
+    }
+    env.seen_open_cells = {
+        Position(1, 1),
+        Position(1, 2),
+        Position(1, 3),
+        Position(1, 4),
+        Position(1, 5),
+    }
+    env.visible_open_cells = set(env.seen_open_cells)
+    env.known_dead_end_cells = {Position(1, 3), Position(1, 4), Position(1, 5)}
+
+    _observation, _reward, terminated, truncated, info = env.step(3)
+
+    assert terminated is False
+    assert truncated is False
+    assert info["dead_end_entries"] == 0
+    assert info["deeper_dead_end_entries"] == 0
+    assert info["step_deeper_dead_end_entry"] is False
+    assert info["reward_breakdown"].dead_end == 0.0
+    assert info["reward_breakdown"].deeper_dead_end == 0.0
 
 
 def test_observation_includes_per_direction_visibility_features() -> None:

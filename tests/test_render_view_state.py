@@ -3,6 +3,7 @@
 from maze_rl.render.view_state import (
     viewer_cell_color,
     viewer_dead_end_cells,
+    viewer_exit_color,
     viewer_explored_cells,
     viewer_grid,
     viewer_monster_position,
@@ -102,3 +103,12 @@ def test_viewer_policy_badge_reports_override_state() -> None:
     )
 
     assert label == "safety override: break loop"
+
+
+def test_viewer_exit_color_brightens_after_exit_is_seen() -> None:
+    """The exit marker should change color once the human has seen the exit."""
+
+    unseen_state = {"exit_seen": False}
+    seen_state = {"exit_seen": True}
+
+    assert viewer_exit_color(unseen_state) != viewer_exit_color(seen_state)

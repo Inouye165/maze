@@ -13,6 +13,8 @@ UNEXPLORED_FLOOR_COLOR = (206, 198, 186)
 TRAVELED_FLOOR_COLOR = (214, 196, 150)
 VISIBLE_DEAD_END_COLOR = (220, 170, 94)
 DIM_DEAD_END_COLOR = (178, 139, 88)
+EXIT_COLOR = (77, 145, 95)
+SEEN_EXIT_COLOR = (219, 183, 86)
 
 
 def viewer_grid(state: Mapping[str, Any]) -> tuple[str, ...]:
@@ -118,6 +120,12 @@ def viewer_exit_position(state: Mapping[str, Any]) -> tuple[int, int] | None:
     """Return the exit position to render for the viewer."""
 
     return _normalize_position(state.get("exit_position"))
+
+
+def viewer_exit_color(state: Mapping[str, Any]) -> tuple[int, int, int]:
+    """Return the exit marker color, brightening once the human has seen it."""
+
+    return SEEN_EXIT_COLOR if bool(state.get("exit_seen", False)) else EXIT_COLOR
 
 
 def _normalize_position(value: Any) -> tuple[int, int] | None:
