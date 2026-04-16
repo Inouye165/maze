@@ -66,8 +66,11 @@ class HeuristicMoveChoice:
     direct_monster_escape: bool
     immediate_reverse: bool
     short_loop_risk: int
+    dead_end_escape_distance: int
+    escaping_dead_end: bool
     enters_dead_end: bool
     known_dead_end: bool
+    commit_to_exit: bool
     wait_action: bool
 
 
@@ -81,6 +84,12 @@ def describe_move_choice(env: MazeEnv, action: int) -> HeuristicMoveChoice | Non
 
     if env.player is None or env.layout is None or env.monster is None:
         return None
+    active_dead_end_component = _active_dead_end_component(env)
+    current_escape_distance = _dead_end_escape_distance(
+        env,
+        env.player,
+        active_dead_end_component,
+    )
     threat_position = _threat_reference_position(env)
     if is_wait_action(env, action):
         current_monster_distance = (
@@ -94,15 +103,21 @@ def describe_move_choice(env: MazeEnv, action: int) -> HeuristicMoveChoice | Non
             speed=0,
             target=env.player,
             visits=0,
-            nearest_unvisited_distance=_nearest_unvisited_distance(env, env.player),
+            nearest_unvisited_distance=_nearest_unvisited_distance(
+                env,
+                env.player,
+            ),
             exit_distance=_path_distance(env, env.player, env.layout.exit_position),
             monster_distance=current_monster_distance,
             monster_distance_gain=0,
             direct_monster_escape=False,
             immediate_reverse=False,
             short_loop_risk=0,
-            enters_dead_end=env.player in env.known_dead_end_cells,
-            known_dead_end=env.player in env.known_dead_end_cells,
+            dead_end_escape_distance=current_escape_distance,
+            escaping_dead_end=False,
+            enters_dead_end=False,
+            known_dead_end=False,
+            commit_to_exit=False,
             wait_action=True,
         )
     direction, speed = env.decode_action(action)
@@ -121,6 +136,19 @@ def describe_move_choice(env: MazeEnv, action: int) -> HeuristicMoveChoice | Non
         if threat_position is not None
         else 9999
     )
+    target_escape_distance = _dead_end_escape_distance(
+        env,
+        target,
+        active_dead_end_component,
+    )
+    escaping_dead_end = (
+        bool(active_dead_end_component)
+        and target_escape_distance < current_escape_distance
+    )
+    known_dead_end = env.is_known_dead_route_target(target)
+    if escaping_dead_end:
+        known_dead_end = False
+    commit_to_exit = _should_commit_to_exit(env, target, exit_distance)
     return HeuristicMoveChoice(
         action=action,
         direction=direction,
@@ -134,8 +162,11 @@ def describe_move_choice(env: MazeEnv, action: int) -> HeuristicMoveChoice | Non
         direct_monster_escape=_is_direct_monster_escape(env, target),
         immediate_reverse=previous_position is not None and first_step_target == previous_position,
         short_loop_risk=_short_loop_risk(env, target),
+        dead_end_escape_distance=target_escape_distance,
+        escaping_dead_end=escaping_dead_end,
         enters_dead_end=_is_dead_end_target(env, target),
-        known_dead_end=env.is_known_dead_route_target(target),
+        known_dead_end=known_dead_end,
+        commit_to_exit=commit_to_exit,
         wait_action=False,
     )
 
@@ -155,10 +186,11 @@ def rank_legal_moves(env: MazeEnv) -> list[HeuristicMoveChoice]:
         wait_choice = describe_move_choice(env, wait_action)
         if wait_choice is not None:
             choices.append(wait_choice)
-    fear_mode = _fear_mode(env, choices)
+    exit_choice = _best_exit_commitment_choice(choices)
+    fear_mode = _fear_mode(env, choices, exit_choice)
     return sorted(
         choices,
-        key=lambda choice: _choice_priority(choice, fear_mode),
+        key=lambda choice: _choice_priority(choice, fear_mode, exit_choice),
     )
 
 
@@ -179,6 +211,21 @@ def should_override_policy(
 
     if chosen is None or best is None or chosen.direction == best.direction:
         return False
+    if best.commit_to_exit and not chosen.commit_to_exit:
+        return True
+    if (
+        best.commit_to_exit
+        and chosen.commit_to_exit
+        and chosen.exit_distance > best.exit_distance
+    ):
+        return True
+    if best.escaping_dead_end and not chosen.escaping_dead_end:
+        return True
+    if (
+        (chosen.known_dead_end or chosen.enters_dead_end)
+        and not (best.known_dead_end or best.enters_dead_end)
+    ):
+        return True
     if chosen.visits > 0 and best.visits == 0:
         return True
     if chosen.immediate_reverse and not best.immediate_reverse:
@@ -256,7 +303,7 @@ def project_action_target(
     first_step_target: Position | None = None
     for step_index in range(speed):
         candidate = current.shifted(delta_row, delta_col)
-        if is_wall_position(env, candidate):
+        if is_wall_position(env, candidate) or candidate == env.monster:
             return first_step_target, current, False
         current = candidate
         if step_index == 0:
@@ -362,6 +409,52 @@ def _short_loop_risk(env: MazeEnv, candidate: Position) -> int:
     return risk
 
 
+def _active_dead_end_component(env: MazeEnv) -> set[Position]:
+    """Return the connected known-dead region currently containing the player."""
+
+    if env.player is None or env.player not in env.known_dead_end_cells:
+        return set()
+
+    component: set[Position] = set()
+    queue: deque[Position] = deque([env.player])
+    while queue:
+        current = queue.popleft()
+        if current in component or current not in env.known_dead_end_cells:
+            continue
+        component.add(current)
+        for candidate in _known_neighbors(env, current):
+            if candidate in env.known_dead_end_cells and candidate not in component:
+                queue.append(candidate)
+    return component
+
+
+def _dead_end_escape_distance(
+    env: MazeEnv,
+    start: Position,
+    active_component: set[Position],
+) -> int:
+    """Return steps from *start* to the nearest remembered cell.
+
+    The destination must lie outside the player's active remembered dead-end region.
+    """
+
+    if not active_component or start not in active_component:
+        return 0
+
+    queue: deque[tuple[Position, int]] = deque([(start, 0)])
+    seen = {start}
+    while queue:
+        current, distance = queue.popleft()
+        for candidate in _known_neighbors(env, current):
+            if candidate in seen:
+                continue
+            if candidate not in active_component:
+                return distance + 1
+            seen.add(candidate)
+            queue.append((candidate, distance + 1))
+    return 9999
+
+
 def _is_dead_end_target(env: MazeEnv, target: Position) -> bool:
     """Return whether the target is a dead-end cell, excluding the maze exit."""
 
@@ -391,11 +484,43 @@ def _is_direct_monster_escape(env: MazeEnv, candidate: Position) -> bool:
     return False
 
 
-def _fear_mode(env: MazeEnv, choices: list[HeuristicMoveChoice]) -> bool:
+def _best_exit_commitment_choice(
+    choices: list[HeuristicMoveChoice],
+) -> HeuristicMoveChoice | None:
+    """Return the best move that safely commits to a seen exit path."""
+
+    exit_choices = [
+        choice
+        for choice in choices
+        if choice.commit_to_exit and not choice.wait_action
+    ]
+    if not exit_choices:
+        return None
+    return min(
+        exit_choices,
+        key=lambda choice: (
+            choice.exit_distance,
+            choice.monster_distance <= 1,
+            choice.monster_distance_gain < 0,
+            choice.visits > 0,
+            choice.visits,
+            -choice.speed,
+            choice.direction,
+        ),
+    )
+
+
+def _fear_mode(
+    env: MazeEnv,
+    choices: list[HeuristicMoveChoice],
+    exit_choice: HeuristicMoveChoice | None,
+) -> bool:
     """Return whether the heuristic should prioritize running from the monster."""
 
     threat_position = _threat_reference_position(env)
     if env.player is None or threat_position is None or env.layout is None or not choices:
+        return False
+    if exit_choice is not None:
         return False
     current_monster_distance = _path_distance(env, env.player, threat_position)
     monster_visible = env.monster in env.visible_open_cells
@@ -485,19 +610,27 @@ def _threat_reference_position(env: MazeEnv) -> Position | None:
     return None
 
 
-def _choice_priority(choice: HeuristicMoveChoice, fear_mode: bool) -> tuple[Any, ...]:
+def _choice_priority(
+    choice: HeuristicMoveChoice,
+    fear_mode: bool,
+    exit_choice: HeuristicMoveChoice | None,
+) -> tuple[Any, ...]:
     """Return a deterministic sort key for heuristic playback choices."""
 
+    commits_to_exit = exit_choice is not None and choice.action == exit_choice.action
     if fear_mode:
+        dead_end_trap = choice.known_dead_end or choice.enters_dead_end
         return (
+            not commits_to_exit,
             choice.monster_distance <= 1,
             choice.monster_distance_gain < 0,
+            dead_end_trap,
             not choice.wait_action and choice.monster_distance_gain == 0,
             -choice.monster_distance_gain,
             -choice.monster_distance,
+            choice.dead_end_escape_distance,
+            not choice.escaping_dead_end,
             -choice.speed,
-            choice.known_dead_end and choice.monster_distance_gain <= 0,
-            choice.enters_dead_end,
             choice.nearest_unvisited_distance,
             choice.visits > 0,
             choice.visits,
@@ -508,6 +641,9 @@ def _choice_priority(choice: HeuristicMoveChoice, fear_mode: bool) -> tuple[Any,
             choice.direction,
         )
     return (
+        not commits_to_exit,
+        choice.dead_end_escape_distance,
+        not choice.escaping_dead_end,
         choice.known_dead_end,
         choice.monster_distance <= 1,
         choice.enters_dead_end,
@@ -523,3 +659,41 @@ def _choice_priority(choice: HeuristicMoveChoice, fear_mode: bool) -> tuple[Any,
         -choice.monster_distance,
         choice.direction,
     )
+
+
+def _should_commit_to_exit(env: MazeEnv, target: Position, exit_distance: int) -> bool:
+    """Return whether moving to *target* should commit the agent to the seen exit."""
+
+    if env.player is None or env.layout is None:
+        return False
+    if env.layout.exit_position not in env.seen_open_cells:
+        return False
+    current_exit_distance = _path_distance(env, env.player, env.layout.exit_position)
+    if current_exit_distance in {0, 9999} or exit_distance >= current_exit_distance:
+        return False
+    if target == env.layout.exit_position:
+        return True
+    threat_position = _threat_reference_position(env)
+    if threat_position is None:
+        return True
+    if target == threat_position:
+        return False
+    monster_exit_distance = _path_distance(env, threat_position, env.layout.exit_position)
+    if monster_exit_distance == 9999:
+        return True
+    if monster_exit_distance == 0:
+        return False
+    player_speed = max(1, int(getattr(env.config, "max_player_speed", 1)))
+    monster_speed = max(
+        1,
+        int(
+            getattr(
+                env,
+                "_active_monster_speed",
+                getattr(env.config, "monster_speed", 1),
+            )
+        ),
+    )
+    player_turns_remaining = (exit_distance + player_speed - 1) // player_speed
+    monster_turns_to_exit = (monster_exit_distance + monster_speed - 1) // monster_speed
+    return player_turns_remaining <= monster_turns_to_exit

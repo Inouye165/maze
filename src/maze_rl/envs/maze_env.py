@@ -92,6 +92,7 @@ class MazeEnv(gym.Env[np.ndarray, int]):
         self.entered_visible_dead_end = 0
         self.avoided_visible_dead_end = 0
         self.avoidable_visible_dead_end_penalties_applied = 0
+        self.deeper_dead_end_entries = 0
         self.trap_threat_penalties_applied = 0
         self.revisits = 0
         self.oscillations = 0
@@ -245,6 +246,7 @@ class MazeEnv(gym.Env[np.ndarray, int]):
         self.entered_visible_dead_end = 0
         self.avoided_visible_dead_end = 0
         self.avoidable_visible_dead_end_penalties_applied = 0
+        self.deeper_dead_end_entries = 0
         self.trap_threat_penalties_applied = 0
         self.revisits = 0
         self.oscillations = 0
@@ -305,6 +307,7 @@ class MazeEnv(gym.Env[np.ndarray, int]):
         revisits = 0
         oscillations = 0
         dead_end_entries = 0
+        deeper_dead_end_entries = 0
         blocked_moves = 0
         frontier_cells = 0
         revisit_depth = 0
@@ -377,7 +380,7 @@ class MazeEnv(gym.Env[np.ndarray, int]):
         for substep in range(player_speed if direction_index is not None else 0):
             if not player_can_continue or terminated or truncated:
                 break
-            moved, revisited, entered_dead_end, visit_depth = self._move_player(direction_index)
+            moved, revisited, entered_dead_end, deeper_dead_end, visit_depth = self._move_player(direction_index)
             if moved:
                 player_path.append(self.player)
                 micro_steps.append(
@@ -398,6 +401,9 @@ class MazeEnv(gym.Env[np.ndarray, int]):
             if entered_dead_end:
                 dead_end_entries += 1
                 self.dead_end_entries += 1
+            if deeper_dead_end:
+                deeper_dead_end_entries += 1
+                self.deeper_dead_end_entries += 1
             if not moved:
                 blocked_moves += 1
                 self.blocked_moves += 1
@@ -416,14 +422,7 @@ class MazeEnv(gym.Env[np.ndarray, int]):
             for substep in range(self._active_monster_speed):
                 if terminated or truncated:
                     break
-                monster_previous_position = self.monster
                 moved = self._move_monster()
-                monster_passed_through_intersection = False
-                if moved and self.player == self.monster:
-                    monster_passed_through_intersection = self._apply_intersection_escape_window(
-                        player_start,
-                        monster_previous_position,
-                    )
                 if moved:
                     monster_path.append(self.monster)
                     micro_steps.append(
@@ -431,53 +430,24 @@ class MazeEnv(gym.Env[np.ndarray, int]):
                             actor="monster",
                             index=len(monster_path),
                             position=self.monster.as_tuple(),
-                            phase=(
-                                f"monster-{substep + 1}-pass"
-                                if monster_passed_through_intersection
-                                else f"monster-{substep + 1}"
-                            ),
+                            phase=f"monster-{substep + 1}",
                         )
                     )
                 if self.player == self.monster:
-                    dodge_target = self._reactive_dodge(monster_previous_position)
-                    if dodge_target is not None:
-                        self.player = dodge_target
-                        self.path_history.append(self.player)
-                        prev_visits = self.visited_counts.get(self.player, 0)
-                        self.visited_counts[self.player] = prev_visits + 1
-                        player_path.append(self.player)
-                        micro_steps.append(
-                            ReplayMicroStep(
-                                actor="player",
-                                index=len(player_path),
-                                position=self.player.as_tuple(),
-                                phase=f"player-dodge-{substep + 1}",
-                            )
+                    terminated = True
+                    reason = "caught"
+                    self.last_capture_rule = "same-cell"
+                    if micro_steps:
+                        last_step = micro_steps[-1]
+                        micro_steps[-1] = ReplayMicroStep(
+                            actor=last_step.actor,
+                            index=last_step.index,
+                            position=last_step.position,
+                            phase=last_step.phase,
+                            capture=True,
                         )
-                        if self.player not in self.unique_visited:
-                            self.unique_visited.add(self.player)
-                            new_cells += 1
-                        elif prev_visits > 0:
-                            revisits += 1
-                            self.revisits += 1
-                        if self.player == self.layout.exit_position:
-                            terminated = True
-                            reason = "escaped"
-                        break  # monster loses remaining substeps after dodge
-                    else:
-                        terminated = True
-                        reason = "caught"
-                        self.last_capture_rule = "same-cell"
-                        if micro_steps:
-                            last_step = micro_steps[-1]
-                            micro_steps[-1] = ReplayMicroStep(
-                                actor=last_step.actor,
-                                index=last_step.index,
-                                position=last_step.position,
-                                phase=last_step.phase,
-                                capture=True,
-                            )
-                        capture_event = self._build_capture_event("monster", substep + 1)
+                    capture_event = self._build_capture_event("monster", substep + 1)
+                    break
 
         self.step_count += 1
         oscillation_severity = self._oscillation_severity()
@@ -558,6 +528,7 @@ class MazeEnv(gym.Env[np.ndarray, int]):
                 oscillations=oscillations,
                 oscillation_severity=oscillation_severity,
                 dead_end_entries=dead_end_entries,
+                deeper_dead_end_entries=deeper_dead_end_entries,
                 avoidable_visible_dead_end_entries=avoidable_visible_dead_end_entries,
                 trap_threat_entries=trap_threat_entries,
                 blocked_moves=blocked_moves,
@@ -611,6 +582,7 @@ class MazeEnv(gym.Env[np.ndarray, int]):
             "oscillations": self.oscillations,
             "no_progress_steps": self.no_progress_steps,
             "dead_end_entries": self.dead_end_entries,
+            "deeper_dead_end_entries": self.deeper_dead_end_entries,
             "visible_dead_end_opportunities": self.visible_dead_end_opportunities,
             "entered_visible_dead_end": self.entered_visible_dead_end,
             "avoided_visible_dead_end": self.avoided_visible_dead_end,
@@ -619,6 +591,7 @@ class MazeEnv(gym.Env[np.ndarray, int]):
             "step_visible_dead_end_opportunity": step_visible_dead_end_opportunity,
             "step_entered_visible_dead_end": step_entered_visible_dead_end,
             "step_avoided_visible_dead_end": step_avoided_visible_dead_end,
+            "step_deeper_dead_end_entry": bool(deeper_dead_end_entries),
             "step_trap_threat_entry": bool(trap_threat_entries),
             "blocked_moves": self.blocked_moves,
             "illegal_moves": self.blocked_moves,
@@ -868,19 +841,58 @@ class MazeEnv(gym.Env[np.ndarray, int]):
             direction_features=self._observation_direction_features(),
         )
 
-    def _move_player(self, direction_index: int) -> tuple[bool, bool, bool, int]:
+    def _move_player(self, direction_index: int) -> tuple[bool, bool, bool, bool, int]:
         delta_row, delta_col = DIRECTION_DELTAS[direction_index]
+        previous_position = self.player
         candidate = self.player.shifted(delta_row, delta_col)
-        if self._is_wall(candidate):
+        if self._is_wall(candidate) or candidate == self.monster:
             self.path_history.append(self.player)
-            return False, False, False, 0
+            return False, False, False, False, 0
         self.player = candidate
         self.path_history.append(self.player)
         previous_visits = self.visited_counts.get(self.player, 0)
         self.visited_counts[self.player] = previous_visits + 1
         revisited = previous_visits > 0
-        entered_dead_end = self._is_dead_end(self.player) and self.player != self.layout.exit_position
-        return True, revisited, entered_dead_end, previous_visits
+        entered_dead_end, deeper_dead_end = self._dead_end_transition(previous_position, self.player)
+        return True, revisited, entered_dead_end, deeper_dead_end, previous_visits
+
+    def _known_dead_end_escape_distance(self, start: Position) -> int:
+        """Return steps from a known dead-end cell to the nearest remembered non-dead cell."""
+
+        if start not in self.known_dead_end_cells:
+            return 0
+
+        queue: deque[tuple[Position, int]] = deque([(start, 0)])
+        visited = {start}
+        while queue:
+            current, distance = queue.popleft()
+            for delta_row, delta_col in DIRECTION_DELTAS:
+                candidate = current.shifted(delta_row, delta_col)
+                if candidate in visited or candidate not in self.seen_open_cells:
+                    continue
+                if candidate not in self.known_dead_end_cells:
+                    return distance + 1
+                visited.add(candidate)
+                queue.append((candidate, distance + 1))
+        return 9999
+
+    def _dead_end_transition(self, previous: Position, current: Position) -> tuple[bool, bool]:
+        """Classify whether a move commits into a dead end and whether it goes deeper."""
+
+        if self.layout is None or current == self.layout.exit_position:
+            return False, False
+
+        previous_known_dead = previous in self.known_dead_end_cells
+        current_known_dead = current in self.known_dead_end_cells
+        if current_known_dead:
+            previous_escape_distance = self._known_dead_end_escape_distance(previous) if previous_known_dead else 0
+            current_escape_distance = self._known_dead_end_escape_distance(current)
+            if current_escape_distance < previous_escape_distance:
+                return False, False
+            return True, current_escape_distance > previous_escape_distance
+
+        entered_structural_dead_end = self._is_dead_end(current)
+        return entered_structural_dead_end, False
 
     def _move_monster(self) -> bool:
         path = self._shortest_path(self.monster, self.player)

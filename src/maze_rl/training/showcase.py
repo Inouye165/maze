@@ -21,9 +21,7 @@ from maze_rl.policies.model_factory import (
     predict_action,
 )
 from maze_rl.policies.action_helpers import (
-    DIRECTION_DELTAS,
     WAIT_ACTION,
-    WAIT_DIRECTION,
     HeuristicMoveChoice,
     choose_heuristic_action,
     describe_move_choice,
@@ -33,9 +31,11 @@ from maze_rl.policies.action_helpers import (
     project_action_target as _project_action_target,
     rank_legal_moves,
     should_override_policy,
-    wait_action_for_env,
 )
 from maze_rl.training.checkpointing import load_checkpoint_metadata, resolve_checkpoint_path
+
+
+__all__ = ["WAIT_ACTION"]
 
 
 @dataclass(frozen=True)
@@ -327,7 +327,14 @@ class PlaybackSession:
             self.policy_override_count += 1
             self.last_override_reason = "heuristic-override"
             if chosen_move is not None and best_move is not None:
-                if chosen_move.visits > 0 and best_move.visits == 0:
+                if best_move.commit_to_exit and not chosen_move.commit_to_exit:
+                    self.last_override_reason = "take-exit"
+                elif (
+                    (chosen_move.known_dead_end or chosen_move.enters_dead_end)
+                    and not (best_move.known_dead_end or best_move.enters_dead_end)
+                ):
+                    self.last_override_reason = "avoid-dead-end"
+                elif chosen_move.visits > 0 and best_move.visits == 0:
                     self.last_override_reason = "prefer-unvisited"
                 elif chosen_move.immediate_reverse and not best_move.immediate_reverse:
                     self.last_override_reason = "avoid-reverse"

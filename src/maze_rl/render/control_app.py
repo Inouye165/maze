@@ -21,6 +21,7 @@ from maze_rl.policies.model_factory import CheckpointCompatibilityError
 from maze_rl.render.view_state import (
     viewer_cell_color,
     viewer_dead_end_cells,
+    viewer_exit_color,
     viewer_explored_cells,
     viewer_exit_position,
     viewer_grid,
@@ -1629,7 +1630,7 @@ class LabControlApp:
             if rendered_monster is not None:
                 self._draw_entity(screen, board_rect, cell_size, rendered_monster, (205, 60, 60), "M", "Monster")
         if exit_position is not None:
-            self._draw_entity(screen, board_rect, cell_size, exit_position, (77, 145, 95), "E", "Exit")
+            self._draw_entity(screen, board_rect, cell_size, exit_position, viewer_exit_color(state), "E", "Exit")
 
         overlay_rect = pygame.Rect(self.game_area.x + 24, board_rect.bottom + 18, self.game_area.width - 48, self.game_area.bottom - board_rect.bottom - 32)
         pygame.draw.rect(screen, SURFACE_CARD_ALT, overlay_rect, border_radius=18)

@@ -17,7 +17,8 @@ class RewardConfig:
     revisit_penalty: float = -0.55
     revisit_depth_penalty: float = -0.18
     oscillation_penalty: float = -1.8
-    dead_end_penalty: float = -1.0
+    dead_end_penalty: float = -1.4
+    deeper_dead_end_penalty: float = -1.2
     avoidable_visible_dead_end_penalty: float = -0.65
     trap_threat_penalty: float = -4.0
     blocked_move_penalty: float = -0.5
