@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from collections import deque
 import inspect
+import json
 import shutil
 import threading
 import time
@@ -108,6 +109,7 @@ class LabAppController:
 
     def __init__(self, checkpoint_dir: str | Path = "checkpoints") -> None:
         self.checkpoint_dir = Path(checkpoint_dir)
+        self.filtered_seeds_path = self.checkpoint_dir / "filtered_seeds.json"
         self.seed_text = "00001"
         self.debug_trace = False
         self.speed_options = [("Slow", 4), ("Normal", 8), ("Fast", 16)]
@@ -139,6 +141,8 @@ class LabAppController:
         self.run_outcomes: deque[str] = deque(maxlen=1000)
         self.total_runs = 0
         self.total_wins = 0
+        self.filtered_seeds = self._load_filtered_seeds()
+        self.use_filtered_seed_once: int | None = None
         self.compare_queue: list[CompareRunEntry] = []
         self.compare_results: list[ShowcaseResult] = []
         self.compare_pause_until = 0.0
@@ -200,6 +204,35 @@ class LabAppController:
                 return
         self.selected_index = len(self.available_checkpoints) - 1
 
+    def _load_filtered_seeds(self) -> set[int]:
+        """Load the persisted set of seeds that should be skipped."""
+
+        try:
+            if not self.filtered_seeds_path.exists():
+                return set()
+            payload = json.loads(self.filtered_seeds_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return set()
+
+        raw_seeds = payload.get("filtered_seeds", payload) if isinstance(payload, dict) else payload
+        if not isinstance(raw_seeds, list):
+            return set()
+
+        normalized: set[int] = set()
+        for item in raw_seeds:
+            try:
+                normalized.add(max(1, int(item)))
+            except (TypeError, ValueError):
+                continue
+        return normalized
+
+    def _save_filtered_seeds(self) -> None:
+        """Persist filtered seeds so Play skips them next time too."""
+
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        payload = {"filtered_seeds": sorted(self.filtered_seeds)}
+        self.filtered_seeds_path.write_text(f"{json.dumps(payload, indent=2)}\n", encoding="utf-8")
+
     def parse_seed(self) -> int:
         """Return the current numeric seed."""
 
@@ -225,6 +258,115 @@ class LabAppController:
         """Persist a normalized numeric seed back to the text field."""
 
         self.seed_text = self.format_seed(seed)
+        if self.use_filtered_seed_once != seed:
+            self.use_filtered_seed_once = None
+
+    def is_seed_filtered(self, seed: int) -> bool:
+        """Return whether a seed is excluded from future play/training."""
+
+        return max(1, int(seed)) in self.filtered_seeds
+
+    def next_playable_seed(self, seed: int) -> int:
+        """Return the next seed that is not currently filtered."""
+
+        candidate = max(1, int(seed))
+        while candidate in self.filtered_seeds:
+            candidate += 1
+        return candidate
+
+    def filter_button_label(self) -> str:
+        """Return the Review-tab label for the current seed filter action."""
+
+        return "Unfilter Seed" if self.is_seed_filtered(self.parse_seed()) else "Filter Seed"
+
+    def can_use_filtered_seed_anyway(self) -> bool:
+        """Return whether the current seed is filtered and can be explicitly forced once."""
+
+        return self.is_seed_filtered(self.parse_seed())
+
+    def use_anyway_button_label(self) -> str:
+        """Return the Basic-tab label for the one-shot filtered-seed override."""
+
+        current_seed = self.parse_seed()
+        if self.use_filtered_seed_once == current_seed:
+            return "Use Anyway Armed"
+        return "Use Anyway"
+
+    def seed_warning_text(self) -> str | None:
+        """Return the warning shown when the typed seed is currently filtered."""
+
+        current_seed = self.parse_seed()
+        if not self.is_seed_filtered(current_seed):
+            return None
+        if self.use_filtered_seed_once == current_seed:
+            return f"Seed {self.format_seed(current_seed)} is masked, but the next run will use it once."
+        next_seed = self.next_playable_seed(current_seed)
+        return (
+            f"Seed {self.format_seed(current_seed)} is masked. Play will skip to "
+            f"{self.format_seed(next_seed)} unless you press Use Anyway."
+        )
+
+    def toggle_filtered_seed(self) -> None:
+        """Toggle the current seed in the filtered-seed set."""
+
+        if self.session is not None or self.is_training_active:
+            self.training_message = "finish the current run before changing filtered seeds"
+            return
+
+        target_seed = self.parse_seed()
+        if self.is_seed_filtered(target_seed):
+            self.filtered_seeds.remove(target_seed)
+            if self.use_filtered_seed_once == target_seed:
+                self.use_filtered_seed_once = None
+            self._save_filtered_seeds()
+            self.training_message = f"seed {self.format_seed(target_seed)} restored to the ladder"
+            return
+
+        self.filtered_seeds.add(target_seed)
+        self._save_filtered_seeds()
+        if self.pending_training_seed == target_seed:
+            self.pending_training_seed = None
+        if self.use_filtered_seed_once == target_seed:
+            self.use_filtered_seed_once = None
+        next_seed = self.next_playable_seed(target_seed)
+        self.set_seed_value(next_seed)
+        self.training_message = (
+            f"filtered seed {self.format_seed(target_seed)}; "
+            f"next playable seed {self.format_seed(next_seed)}"
+        )
+
+    def arm_use_filtered_seed_once(self) -> None:
+        """Allow the currently typed masked seed to run one time anyway."""
+
+        if self.session is not None or self.is_training_active:
+            self.training_message = "finish the current run before forcing a masked seed"
+            return
+
+        target_seed = self.parse_seed()
+        if not self.is_seed_filtered(target_seed):
+            self.use_filtered_seed_once = None
+            self.training_message = f"seed {self.format_seed(target_seed)} is already playable"
+            return
+
+        self.use_filtered_seed_once = target_seed
+        self.training_message = f"seed {self.format_seed(target_seed)} will be used once on the next run"
+
+    def _resolve_seed_for_session(self, requested_seed: int) -> tuple[int, str | None]:
+        """Skip filtered seeds before starting playback or focused training."""
+
+        if self.use_filtered_seed_once == requested_seed:
+            self.use_filtered_seed_once = None
+            self.set_seed_value(requested_seed)
+            return requested_seed, f"using masked seed {self.format_seed(requested_seed)} by request"
+
+        resolved_seed = self.next_playable_seed(requested_seed)
+        self.set_seed_value(resolved_seed)
+        if resolved_seed == requested_seed:
+            return resolved_seed, None
+        return (
+            resolved_seed,
+            f"seed {self.format_seed(requested_seed)} is filtered; using {self.format_seed(resolved_seed)}",
+        )
 
     def parse_cycle_count(self) -> int:
         """Return the requested training cycle count."""
@@ -286,6 +428,7 @@ class LabAppController:
         if not self.can_start_run:
             self.training_message = "finish training or the current run first"
             return
+        seed, seed_note = self._resolve_seed_for_session(seed)
         if not preserve_seed_ladder:
             self.seed_ladder_active = False
             self.pending_training_seed = None
@@ -303,7 +446,7 @@ class LabAppController:
         self.last_result = None
         self.last_state = self.session.latest_state
         self.paused = False
-        self.training_message = f"running innate play on seed {self.format_seed(seed)}"
+        self.training_message = seed_note or f"running innate play on seed {self.format_seed(seed)}"
 
     def start_current_ai_run(self) -> None:
         """Run one frozen episode using the selected checkpoint."""
@@ -316,6 +459,7 @@ class LabAppController:
         if not self.can_start_run:
             self.training_message = "finish training or the current run first"
             return
+        seed, seed_note = self._resolve_seed_for_session(seed)
         if not preserve_seed_ladder:
             self.seed_ladder_active = False
             self.pending_training_seed = None
@@ -347,7 +491,7 @@ class LabAppController:
         self.last_result = None
         self.last_state = self.session.latest_state
         self.paused = False
-        self.training_message = f"running trained play from ckpt {episode:04d} on seed {self.format_seed(seed)}"
+        self.training_message = seed_note or f"running trained play from ckpt {episode:04d} on seed {self.format_seed(seed)}"
 
     def start_play(self) -> None:
         """Run the seed ladder until the first loss, then train on that failed maze."""
@@ -435,7 +579,7 @@ class LabAppController:
             self.training_message = "finish training or the current run first"
             return
         self.seed_ladder_active = False
-        seed = self.parse_seed()
+        seed, seed_note = self._resolve_seed_for_session(self.parse_seed())
         self._clear_compare_state()
         self.compare_results = []
         self.compare_queue = []
@@ -450,7 +594,7 @@ class LabAppController:
         if not self.compare_queue:
             self.training_message = "compare finished: no milestone checkpoints found"
             return
-        self.training_message = f"comparing milestones on seed {seed}"
+        self.training_message = seed_note or f"comparing milestones on seed {seed}"
         self._start_next_compare_run()
 
     def pause(self) -> None:
@@ -497,6 +641,9 @@ class LabAppController:
         if self.is_training_active or self.session is not None:
             self.training_message = "stop the current run before training"
             return
+        seed_note: str | None = None
+        if fixed_maze_seed is not None:
+            fixed_maze_seed, seed_note = self._resolve_seed_for_session(fixed_maze_seed)
         self.seed_ladder_active = False
         self.last_training_increment = additional_episodes
         self.active_training_seed_override = fixed_maze_seed
@@ -513,6 +660,8 @@ class LabAppController:
             self.training_message = (
                 f"training starts on failed seed {self.format_seed(fixed_maze_seed)} then jumps forward by random 1..1000"
             )
+            if seed_note is not None:
+                self.training_message = f"{seed_note}; {self.training_message}"
 
         def _report_progress(progress: dict[str, Any]) -> None:
             self.training_progress = progress
@@ -1112,6 +1261,10 @@ class LabAppController:
                     f"Recent win %: 10={cards[0].percentage * 100:.0f}% | 100={cards[1].percentage * 100:.0f}% | 1000={cards[2].percentage * 100:.0f}%",
                 ]
             )
+        if self.filtered_seeds:
+            preview = ", ".join(self.format_seed(seed) for seed in sorted(self.filtered_seeds)[:6])
+            suffix = "" if len(self.filtered_seeds) <= 6 else " ..."
+            lines.append(f"Filtered seeds ({len(self.filtered_seeds)}): {preview}{suffix}")
         latest_summary = self.current_training_summary()
         if latest_summary is not None:
             lines.extend(
@@ -1149,6 +1302,10 @@ class LabAppController:
             lines.append(
                 f"Seed ladder: {self.total_wins}/{self.total_runs} wins | latest failed seed {self.format_seed(self.last_failed_seed) if self.last_failed_seed is not None else 'none'}"
             )
+        if self.filtered_seeds:
+            preview = ", ".join(self.format_seed(seed) for seed in sorted(self.filtered_seeds)[:5])
+            suffix = "" if len(self.filtered_seeds) <= 5 else " ..."
+            lines.append(f"Filtered seeds: {preview}{suffix}")
         if self.last_result is not None:
             lines.extend(
                 [
@@ -1319,6 +1476,7 @@ class LabControlApp:
         if event.key == K_BACKSPACE:
             if self.active_input == "seed":
                 self.controller.seed_text = self.controller.seed_text[:-1]
+                self.controller.use_filtered_seed_once = None
             else:
                 self.controller.cycle_input_text = self.controller.cycle_input_text[:-1]
         elif event.key == K_RETURN:
@@ -1327,6 +1485,7 @@ class LabControlApp:
             self.active_input = None
         elif event.unicode.isdigit():
             if self.active_input == "seed" and len(self.controller.seed_text) < 10:
+                self.controller.use_filtered_seed_once = None
                 if self.controller.seed_text in {"", "00001"}:
                     self.controller.seed_text = event.unicode
                 else:
@@ -1430,9 +1589,24 @@ class LabControlApp:
             play_width = 146
             stop_width = 78
             small_width = (body_rect.width - play_width - stop_width - 3 * gap) // 2
-            button_y = body_rect.y + 96
+            seed_button_y = body_rect.y + 18
+            button_y = body_rect.y + 102
             buttons.extend(
                 [
+                    Button(
+                        self.controller.filter_button_label(),
+                        pygame.Rect(left + 256, seed_button_y, 88, 36),
+                        self.controller.toggle_filtered_seed,
+                        enabled=not self.controller.is_training_active and self.controller.session is None,
+                        kind="accent" if self.controller.is_seed_filtered(self.controller.parse_seed()) else "danger",
+                    ),
+                    Button(
+                        self.controller.use_anyway_button_label(),
+                        pygame.Rect(left + 350, seed_button_y, 94, 36),
+                        self.controller.arm_use_filtered_seed_once,
+                        enabled=not self.controller.is_training_active and self.controller.session is None and self.controller.can_use_filtered_seed_anyway(),
+                        kind="primary",
+                    ),
                     Button(
                         "Play",
                         pygame.Rect(left, button_y, play_width, 40),
@@ -1510,22 +1684,29 @@ class LabControlApp:
                         kind="accent",
                     ),
                     Button(
-                        "Previous Ckpt",
-                        pygame.Rect(review_rect.x + 12, review_rect.y + 170, 140, row_height),
+                        "Prev Ckpt",
+                        pygame.Rect(review_rect.x + 12, review_rect.y + 170, 102, row_height),
                         lambda: self.controller.cycle_checkpoint(-1),
                         enabled=bool(self.controller.available_checkpoints) and self.controller.can_start_run,
                     ),
                     Button(
                         "Next Ckpt",
-                        pygame.Rect(review_rect.x + 164, review_rect.y + 170, 140, row_height),
+                        pygame.Rect(review_rect.x + 126, review_rect.y + 170, 102, row_height),
                         lambda: self.controller.cycle_checkpoint(1),
                         enabled=bool(self.controller.available_checkpoints) and self.controller.can_start_run,
                     ),
                     Button(
                         "Latest",
-                        pygame.Rect(review_rect.x + 316, review_rect.y + 170, 148, row_height),
+                        pygame.Rect(review_rect.x + 240, review_rect.y + 170, 102, row_height),
                         self.controller.use_latest_checkpoint,
                         enabled=bool(self.controller.available_checkpoints) and self.controller.can_start_run,
+                    ),
+                    Button(
+                        self.controller.filter_button_label(),
+                        pygame.Rect(review_rect.x + 354, review_rect.y + 170, 110, row_height),
+                        self.controller.toggle_filtered_seed,
+                        enabled=not self.controller.is_training_active and self.controller.session is None,
+                        kind="accent" if self.controller.is_seed_filtered(self.controller.parse_seed()) else "danger",
                     ),
                 ]
             )
@@ -1704,8 +1885,20 @@ class LabControlApp:
         self._draw_input(screen, self.seed_input_rect, "Start Seed", self.controller.seed_display_text(self.active_input == "seed"), self.active_input == "seed")
         self._draw_input(screen, self.cycle_input_rect, "Cycles", self.controller.cycle_input_text, self.active_input == "cycles")
 
+        seed_warning = self.controller.seed_warning_text()
+        if seed_warning is not None:
+            warning_color = ACCENT if self.controller.use_filtered_seed_once == self.controller.parse_seed() else WARNING
+            self._draw_wrapped_text(
+                screen,
+                self.small_font,
+                [seed_warning],
+                warning_color,
+                pygame.Rect(controls_body.x, controls_body.y + 60, controls_body.width, 32),
+                line_gap=2,
+            )
+
         mode_surface = self.heading_font.render(self.controller.play_mode_status(), True, PRIMARY_DARK)
-        screen.blit(mode_surface, (controls_body.x, controls_body.y + 62))
+        screen.blit(mode_surface, (controls_body.x, controls_body.y + 82))
 
         self._draw_card(screen, stats_rect, "Run Performance")
         self._draw_basic_training_summary(screen, stats_rect)

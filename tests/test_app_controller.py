@@ -109,6 +109,18 @@ def test_basic_tab_uses_play_label_instead_of_marks_play(tmp_path: Path) -> None
     assert "Marks Play" not in labels
 
 
+def test_basic_tab_exposes_seed_filter_and_use_anyway_controls(tmp_path: Path) -> None:
+    """The Basic tab should surface masked-seed controls next to the seed input."""
+
+    _create_checkpoints(tmp_path, episodes=(0,))
+
+    app = LabControlApp(checkpoint_dir=tmp_path)
+    labels = app.visible_button_labels()
+
+    assert "Filter Seed" in labels
+    assert "Use Anyway" in labels
+
+
 def test_control_panel_buttons_stay_within_visible_panel(tmp_path: Path) -> None:
     """Visible buttons should fit inside the right-side panel for every tab."""
 
@@ -121,6 +133,19 @@ def test_control_panel_buttons_stay_within_visible_panel(tmp_path: Path) -> None
         app.active_tab = tab_name
         for button in app.build_buttons():
             assert allowed_bounds.contains(button.rect), (tab_name, button.label, button.rect)
+
+
+def test_review_tab_exposes_seed_filter_toggle(tmp_path: Path) -> None:
+    """The Review tab should expose a filter toggle for the current seed."""
+
+    _create_checkpoints(tmp_path, episodes=(0,))
+
+    app = LabControlApp(checkpoint_dir=tmp_path)
+    app.active_tab = "review"
+
+    labels = app.visible_button_labels()
+
+    assert "Filter Seed" in labels
 
 
 def test_play_runs_innate_mode_without_checkpoint(tmp_path: Path) -> None:
@@ -344,6 +369,138 @@ def test_play_prefers_explicitly_selected_seed_over_armed_training_seed(
     assert controller.seed_ladder_active is True
     assert controller.session is not None
     assert controller.current_run_seed == 7
+
+
+def test_filtered_seed_is_skipped_and_pending_training_is_cleared(tmp_path: Path) -> None:
+    """Filtering a seed should move Play to the next seed and disarm training on that seed."""
+
+    _create_checkpoints(tmp_path, episodes=(0,))
+    controller = LabAppController(checkpoint_dir=tmp_path)
+    controller.pending_training_seed = 1
+
+    controller.toggle_filtered_seed()
+
+    assert controller.is_seed_filtered(1) is True
+    assert controller.pending_training_seed is None
+    assert controller.seed_text == "00002"
+
+    controller.start_play()
+
+    assert controller.session is not None
+    assert controller.current_run_seed == 2
+    assert controller.seed_text == "00002"
+
+
+def test_masked_typed_seed_warns_and_can_run_once_anyway(tmp_path: Path) -> None:
+    """Typed masked seeds should warn by default and only run when explicitly armed."""
+
+    _create_checkpoints(tmp_path, episodes=(0,))
+    controller = LabAppController(checkpoint_dir=tmp_path)
+    controller.filtered_seeds.add(7)
+    controller.set_seed_value(7)
+
+    assert controller.seed_warning_text() is not None
+    assert controller.can_use_filtered_seed_anyway() is True
+
+    controller.start_play()
+
+    assert controller.session is not None
+    assert controller.current_run_seed == 8
+
+    controller.reset()
+    controller.set_seed_value(7)
+    controller.arm_use_filtered_seed_once()
+
+    assert controller.seed_warning_text() is not None
+    assert controller.use_filtered_seed_once == 7
+
+    controller.start_play()
+
+    assert controller.session is not None
+    assert controller.current_run_seed == 7
+    assert controller.use_filtered_seed_once is None
+
+
+def test_seed_ladder_auto_increment_skips_masked_seed(tmp_path: Path, monkeypatch) -> None:
+    """Auto-advance should skip masked seeds instead of replaying them."""
+
+    _create_checkpoints(tmp_path, episodes=(0,))
+
+    class FakePlaybackSession:
+        def __init__(
+            self,
+            checkpoint_path,
+            checkpoint_label: str,
+            seed: int,
+            debug_trace: bool,
+            allow_policy_override: bool,
+        ) -> None:
+            _ = checkpoint_path
+            _ = debug_trace
+            self.allow_policy_override = allow_policy_override
+            self.seed = seed
+            self.checkpoint_label = checkpoint_label
+            self.latest_state = {
+                "grid": ("###", "#.#", "###"),
+                "full_grid": ("###", "#.#", "###"),
+                "player_position": (1, 1),
+                "monster_position": (1, 1),
+                "exit_position": (1, 1),
+                "seed": seed,
+            }
+
+        def advance(self):
+            result = ShowcaseResult(
+                checkpoint=self.checkpoint_label,
+                status="ok",
+                outcome="escaped",
+                escape_rate=1.0,
+                coverage=0.5,
+                steps=12,
+                revisits=1,
+                oscillations=0,
+                dead_ends=0,
+                start_monster_distance=4.0,
+                time_to_capture=None,
+                frontier_rate=0.4,
+                peak_no_progress_streak=0,
+                final_player_position=(1, 1),
+                final_monster_position=(1, 1),
+                final_distance=0,
+                capture_rule=None,
+                final_state=dict(self.latest_state),
+                checkpoint_path="fake",
+                seed=self.seed,
+            )
+            return dict(self.latest_state), result
+
+        def build_recorded_run(self):
+            return type("RecordedRunStub", (), {"frames": [dict(self.latest_state)]})()
+
+    monkeypatch.setattr("maze_rl.render.control_app.PlaybackSession", FakePlaybackSession)
+
+    controller = LabAppController(checkpoint_dir=tmp_path)
+    controller.filtered_seeds.add(2)
+
+    controller.start_play()
+    controller.update()
+
+    assert controller.session is not None
+    assert controller.current_run_seed == 3
+    assert controller.seed_text == "00003"
+
+
+def test_filtered_seed_list_persists_across_controller_instances(tmp_path: Path) -> None:
+    """Filtered seeds should persist so excluded maps stay excluded after restart."""
+
+    controller = LabAppController(checkpoint_dir=tmp_path)
+
+    controller.toggle_filtered_seed()
+
+    reloaded = LabAppController(checkpoint_dir=tmp_path)
+
+    assert reloaded.is_seed_filtered(1) is True
+    assert reloaded.filtered_seeds_path.exists()
 
 
 def test_app_controller_uses_mode_specific_checkpoint_directories(tmp_path: Path) -> None:
