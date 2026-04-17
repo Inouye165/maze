@@ -35,6 +35,8 @@ from maze_rl.render.view_state import (
 from maze_rl.training.checkpointing import checkpoint_is_complete, latest_checkpoint, list_checkpoints, load_checkpoint_metadata, resolve_checkpoint_path
 from maze_rl.training.showcase import (
     BaselinePlaybackSession,
+    PLAYBACK_MODE_ASSISTED,
+    PLAYBACK_MODE_RAW,
     PlaybackSession,
     RecordedPlaybackSession,
     RecordedRun,
@@ -123,6 +125,7 @@ class LabAppController:
         self.paused = False
         self.current_mode = "idle"
         self.selected_mode = "baseline-legal-mover"
+        self.playback_mode = PLAYBACK_MODE_RAW
         self.training_mode = "maze-only"
         self.training_thread: threading.Thread | None = None
         self.training_stop_event: threading.Event | None = None
@@ -153,6 +156,39 @@ class LabAppController:
         if self.available_checkpoints:
             self.selected_mode = "current-learned-ai"
             self.selected_index = len(self.available_checkpoints) - 1
+
+    def set_playback_mode(self, mode: str) -> None:
+        """Set the learned-policy playback mode used by review and ladder runs."""
+
+        if mode not in {PLAYBACK_MODE_RAW, PLAYBACK_MODE_ASSISTED}:
+            raise ValueError(f"Unsupported playback mode: {mode}")
+        self.playback_mode = mode
+        self.training_message = f"playback mode set to {self.playback_mode_label().lower()}"
+
+    def toggle_playback_mode(self) -> None:
+        """Toggle between honest raw playback and assisted playback."""
+
+        if self.playback_mode == PLAYBACK_MODE_RAW:
+            self.set_playback_mode(PLAYBACK_MODE_ASSISTED)
+            return
+        self.set_playback_mode(PLAYBACK_MODE_RAW)
+
+    def playback_mode_label(self) -> str:
+        """Return the small human-facing playback mode label."""
+
+        return "Raw Policy" if self.playback_mode == PLAYBACK_MODE_RAW else "Assisted Policy"
+
+    def playback_mode_button_label(self) -> str:
+        """Return the toggle button label used by the app UI."""
+
+        return f"Mode: {self.playback_mode_label()}"
+
+    def start_play_button_label(self) -> str:
+        """Return the Basic-tab play label for the active playback mode."""
+
+        if self.selected_checkpoint is None:
+            return "Play Baseline"
+        return "Play Raw" if self.playback_mode == PLAYBACK_MODE_RAW else "Play Assisted"
 
     @property
     def selected_checkpoint(self) -> tuple[int, Path] | None:
@@ -475,7 +511,7 @@ class LabAppController:
                 checkpoint_label=f"ckpt {episode:04d}",
                 seed=seed,
                 debug_trace=self.debug_trace,
-                allow_policy_override=True,
+                playback_mode=self.playback_mode,
             )
         except CheckpointCompatibilityError:
             self.session = None
@@ -491,7 +527,10 @@ class LabAppController:
         self.last_result = None
         self.last_state = self.session.latest_state
         self.paused = False
-        self.training_message = seed_note or f"running trained play from ckpt {episode:04d} on seed {self.format_seed(seed)}"
+        mode_prefix = "raw policy" if self.playback_mode == PLAYBACK_MODE_RAW else "assisted policy"
+        self.training_message = seed_note or (
+            f"running {mode_prefix} from ckpt {episode:04d} on seed {self.format_seed(seed)}"
+        )
 
     def start_play(self) -> None:
         """Run the seed ladder until the first loss, then train on that failed maze."""
@@ -882,7 +921,7 @@ class LabAppController:
                     checkpoint_label=f"ckpt {entry.checkpoint_episode:04d}",
                     seed=self.parse_seed(),
                     debug_trace=self.debug_trace,
-                    allow_policy_override=True,
+                    playback_mode=self.playback_mode,
                 )
             except CheckpointCompatibilityError as error:
                 self.compare_results.append(
@@ -896,7 +935,10 @@ class LabAppController:
                 continue
             self.last_state = self.session.latest_state
             self.last_result = None
-            self.training_message = f"compare running ckpt {entry.checkpoint_episode:04d}"
+            self.training_message = (
+                f"compare running ckpt {entry.checkpoint_episode:04d} "
+                f"in {self.playback_mode_label().lower()}"
+            )
             return
         self.training_message = "compare milestones finished"
 
@@ -923,8 +965,8 @@ class LabAppController:
             return "Seed Ladder"
         labels = {
             "idle": "Idle",
-            "baseline-legal-mover": "Innate",
-            "current-learned-ai": "Trained",
+            "baseline-legal-mover": "Heuristic Baseline",
+            "current-learned-ai": self.playback_mode_label(),
             "training": "Training",
             "replay": "Replay",
             "compare-milestones": "Compare Milestones",
@@ -936,8 +978,8 @@ class LabAppController:
 
     def selected_mode_label(self) -> str:
         labels = {
-            "baseline-legal-mover": "Play Innate",
-            "current-learned-ai": "Play Trained",
+            "baseline-legal-mover": "Play Heuristic Baseline",
+            "current-learned-ai": f"Play {self.playback_mode_label()}",
             "replay": "Replay Last Run",
             "compare-milestones": "Auto Compare Milestones",
         }
@@ -965,16 +1007,16 @@ class LabAppController:
         """Return the small plain-English mode label shown near Play."""
 
         if self.current_mode == "baseline-legal-mover":
-            return "Policy: Innate"
+            return "Policy: Heuristic Baseline"
         if self.current_mode == "current-learned-ai":
             selected = self.selected_checkpoint
             if selected is None:
-                return "Policy: Trained"
-            return f"Policy: Trained (ckpt {selected[0]:04d})"
+                return f"Policy: {self.playback_mode_label()}"
+            return f"Policy: {self.playback_mode_label()} (ckpt {selected[0]:04d})"
         selected = self.selected_checkpoint
         if selected is None:
-            return "Policy: Innate"
-        return f"Policy: Trained (ckpt {selected[0]:04d})"
+            return "Policy: Heuristic Baseline"
+        return f"Policy: {self.playback_mode_label()} (ckpt {selected[0]:04d})"
 
     def all_time_training_card(self) -> TrainingStatCard:
         """Return the compact all-time training summary for the Basic tab."""
@@ -1608,7 +1650,7 @@ class LabControlApp:
                         kind="primary",
                     ),
                     Button(
-                        "Play",
+                        self.controller.start_play_button_label(),
                         pygame.Rect(left, button_y, play_width, 40),
                         self.controller.start_play,
                         enabled=self.controller.can_start_run,
@@ -1670,18 +1712,24 @@ class LabControlApp:
                         enabled=self.controller.session is not None or self.controller.last_state is not None,
                     ),
                     Button(
-                        "Replay Last Run",
-                        pygame.Rect(review_rect.x + 12, review_rect.y + 122, 220, 40),
+                        "Replay Last",
+                        pygame.Rect(review_rect.x + 12, review_rect.y + 122, 146, 40),
                         self.controller.replay_last_run,
                         enabled=self.controller.can_start_run and self.controller.last_recorded_run is not None,
                         kind="primary",
                     ),
                     Button(
-                        "Compare Milestones",
-                        pygame.Rect(review_rect.x + 244, review_rect.y + 122, 220, 40),
+                        "Compare",
+                        pygame.Rect(review_rect.x + 170, review_rect.y + 122, 146, 40),
                         self.controller.start_compare_milestones,
                         enabled=self.controller.can_start_run,
                         kind="accent",
+                    ),
+                    Button(
+                        self.controller.playback_mode_button_label(),
+                        pygame.Rect(review_rect.x + 328, review_rect.y + 122, 148, 40),
+                        self.controller.toggle_playback_mode,
+                        enabled=self.controller.can_start_run and self.controller.selected_checkpoint is not None,
                     ),
                     Button(
                         "Prev Ckpt",

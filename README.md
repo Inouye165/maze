@@ -85,6 +85,18 @@ Train from scratch:
 python -m maze_rl.cli train --episodes 500
 ```
 
+Train on the full human-known map while appending an optional local tactical patch:
+
+```powershell
+python -m maze_rl.cli train --episodes 500 --enable-local-tactical-view --local-tactical-radius 2
+```
+
+Train with explicit whole-maze curriculum stages:
+
+```powershell
+python -m maze_rl.cli train --episodes 500 --curriculum-stage 0:9:9:1:10:60:20:1:bootstrap --curriculum-stage 20:11:11:2:7:70:18:1:easy --curriculum-stage 50:13:13:4:4:85:16:1:intermediate --curriculum-stage 80:15:15:6:1:100:15:1:full
+```
+
 Train without the easier early curriculum:
 
 ```powershell
@@ -115,6 +127,18 @@ Watch one checkpoint on one seed:
 python -m maze_rl.cli watch --checkpoint checkpoints/ckpt_0100.zip --seed 12345
 ```
 
+Watch honest raw learned-policy playback:
+
+```powershell
+python -m maze_rl.cli watch --checkpoint checkpoints/ckpt_0100.zip --seed 12345 --playback-mode raw
+```
+
+Watch assisted playback with the heuristic safety net explicitly enabled:
+
+```powershell
+python -m maze_rl.cli watch --checkpoint checkpoints/ckpt_0100.zip --seed 12345 --playback-mode assisted
+```
+
 Watch with per-step debug tracing and on-screen coordinate overlay:
 
 ```powershell
@@ -139,6 +163,12 @@ Run the same showcase without opening pygame:
 python -m maze_rl.cli showcase --checkpoints 0 50 100 200 500 1000 --seed 12345 --headless
 ```
 
+Run a heuristic-only baseline showcase for comparison:
+
+```powershell
+python -m maze_rl.cli showcase --checkpoints 0 50 100 200 500 1000 --seed 12345 --headless --playback-mode heuristic
+```
+
 Showcase with per-step trace output:
 
 ```powershell
@@ -158,7 +188,7 @@ The showcase command also skips missing checkpoints, writes a JSON summary to `r
 The app command opens a larger local pygame control panel with:
 
 - a game/playback area
-- Baseline Legal Mover, Run Current AI, Replay Last Run, and Compare Milestones modes
+- Heuristic Baseline, Raw Policy, Assisted Policy, Replay Last Run, and Compare Milestones modes
 - Start, Pause, Resume, Replay, and Step controls
 - playback speed controls
 - seed input and checkpoint selection
@@ -270,6 +300,8 @@ Monster speed is fixed at 6 movement substeps per environment step. Player speed
 
 Training now uses a configurable curriculum defined in `MazeConfig`.
 
+The curriculum changes the active maze dimensions for training episodes, but the observation vector remains sized for the full configured map. That keeps the policy learning on smaller whole mazes early without switching to a local-only crop representation.
+
 The default schedule is meant to make the first visible milestones easier to learn:
 
 - episodes 0 to 19: 9 x 9 mazes, monster speed 1, monster delayed by 10 steps
@@ -278,6 +310,35 @@ The default schedule is meant to make the first visible milestones easier to lea
 - episodes 80 and later: full 15 x 15 difficulty, monster speed 6, monster delayed by 1 step
 
 Frozen evaluation and watch mode always use the full non-curriculum setting from checkpoint metadata.
+
+## Observation And Playback Architecture
+
+Primary observation stays global:
+
+- The policy always receives the full configured human-known map as the primary observation prefix.
+- Unknown cells stay unknown.
+- Curriculum shrinks the active maze during training stages, not the observation schema.
+
+Optional local tactical view is additive:
+
+- `enable_local_tactical_view` appends a player-centered tactical patch after the global map features.
+- `local_tactical_radius` controls the patch radius.
+- `local_tactical_include_monster_memory` appends a last-seen-monster channel when that state exists.
+- The scalar feature tail remains unchanged, so the global map and rollout metrics still occupy stable positions.
+
+Action masks are now legality-only in raw policy mode:
+
+- Illegal moves are masked.
+- Legal moves remain available, even when the monster is visible.
+- Flee heuristics are no longer injected into learned-policy masking.
+
+Playback modes are explicit:
+
+- `raw`: honest learned-policy playback with no heuristic override.
+- `assisted`: learned policy plus explicit heuristic override when the assist path triggers.
+- `heuristic`: heuristic-only baseline for comparison.
+
+The local control app defaults trained playback to raw mode and shows the active mode in the button text, status label, and viewer badge.
 
 ## Frozen Evaluation
 
@@ -295,7 +356,7 @@ That makes comparison between checkpoints meaningful.
 Run the test suite with:
 
 ```powershell
-pytest
+python -m pytest
 ```
 
 The tests cover:
@@ -306,6 +367,9 @@ The tests cover:
 - frozen evaluation not mutating checkpoint artifacts
 - multi-seed evaluation aggregation
 - training curriculum versus frozen evaluation behavior
+- additive local tactical observation encoding
+- raw versus assisted playback wiring
+- illegal-only learned-policy action masking
 
 ## Current Limitations
 
@@ -313,6 +377,30 @@ The tests cover:
 - the monster policy is deterministic shortest-path pursuit, which is useful for reproducibility but not for rich adversarial behavior
 - the baseline ships with PPO first; recurrent experiments are available but not tuned yet
 - the training defaults are meant to be workable, not optimal
+
+## Config Flags
+
+Observation flags:
+
+- `--enable-local-tactical-view`
+- `--local-tactical-radius`
+- `--local-tactical-include-monster-memory`
+
+Curriculum flags:
+
+- `--disable-curriculum`
+- `--curriculum-stage start:rows:cols:monster_speed:monster_activation_delay:max_episode_steps:stall_threshold[:monster_move_interval[:label]]`
+
+Playback flags:
+
+- `watch --playback-mode raw|assisted|heuristic`
+- `showcase --playback-mode raw|assisted|heuristic`
+
+How to tell which mode you are watching:
+
+- CLI watch/showcase uses the explicit `--playback-mode` value.
+- The pygame viewer overlay shows `mode: raw`, `mode: assisted`, or `mode: heuristic`.
+- The control app labels the active trained mode as `Raw Policy` or `Assisted Policy`.
 
 ## Future Ideas
 

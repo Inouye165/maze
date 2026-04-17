@@ -45,3 +45,20 @@ def test_training_curriculum_starts_easier_than_frozen_eval() -> None:
     assert training_info["curriculum_stage"] == "bootstrap"
     assert training_info["monster_speed"] < frozen_info["monster_speed"]
     assert training_info["monster_activation_delay"] > frozen_info["monster_activation_delay"]
+
+
+def test_curriculum_progresses_from_smaller_whole_mazes_to_full_size() -> None:
+    """Curriculum stages should grow the active maze while keeping the full observation size fixed."""
+
+    maze_config = MazeConfig()
+    env = MazeEnv(maze_config, training_mode=True)
+
+    early_stage = env._resolve_curriculum_stage(0)
+    late_stage = env._resolve_curriculum_stage(80)
+
+    assert early_stage.rows < maze_config.rows
+    assert early_stage.cols < maze_config.cols
+    assert late_stage.rows == maze_config.rows
+    assert late_stage.cols == maze_config.cols
+    assert env.observation_spec.rows == maze_config.rows
+    assert env.observation_spec.cols == maze_config.cols

@@ -57,7 +57,13 @@ class MazeEnv(gym.Env[np.ndarray, int]):
         super().__init__()
         self.config = config or MazeConfig()
         self.training_mode = training_mode
-        self.observation_spec = ObservationSpec(rows=self.config.rows, cols=self.config.cols)
+        self.observation_spec = ObservationSpec(
+            rows=self.config.rows,
+            cols=self.config.cols,
+            local_tactical_enabled=self.config.enable_local_tactical_view,
+            local_tactical_radius=self.config.local_tactical_radius,
+            local_tactical_include_monster_memory=self.config.local_tactical_include_monster_memory,
+        )
         self.observation_space = build_observation_space(self.observation_spec)
         self.action_space = gym.spaces.Discrete(4 * self.config.max_player_speed + 1)
         self._episode_index = 0
@@ -671,39 +677,15 @@ class MazeEnv(gym.Env[np.ndarray, int]):
 
         if self.player is None:
             return [True] * int(self.action_space.n)
-        from maze_rl.policies.action_helpers import describe_move_choice, project_action_target, rank_legal_moves, should_override_policy
+        from maze_rl.policies.action_helpers import project_action_target
 
         masks: list[bool] = []
         for action in range(int(self.action_space.n)):
             if action == self.wait_action_index:
-                masks.append(False)
+                masks.append(True)
                 continue
             _first_step_target, _target, completed_full_speed = project_action_target(self, action)
             masks.append(completed_full_speed)
-        ranked_moves = rank_legal_moves(self)
-        best_move = ranked_moves[0] if ranked_moves else None
-        if best_move is None:
-            return masks
-        if best_move.wait_action:
-            wait_masks = [False] * int(self.action_space.n)
-            wait_masks[self.wait_action_index] = True
-            return wait_masks
-        if self.monster is not None and self.monster in self.visible_open_cells and best_move.monster_distance_gain > 0:
-            flee_masks = [False] * int(self.action_space.n)
-            if 0 <= best_move.action < len(flee_masks):
-                flee_masks[best_move.action] = True
-                return flee_masks
-        filtered_masks = list(masks)
-        for action, allowed in enumerate(masks):
-            if not allowed:
-                continue
-            chosen_move = describe_move_choice(self, action)
-            if chosen_move is None:
-                continue
-            if should_override_policy(chosen_move, best_move, chosen_confidence=None, confidence_gap=None):
-                filtered_masks[action] = False
-        if any(filtered_masks):
-            return filtered_masks
         return masks
 
     def _is_trap_threat_active(self, current_monster_distance: int) -> bool:
@@ -826,6 +808,7 @@ class MazeEnv(gym.Env[np.ndarray, int]):
             layout=self.layout,
             player=self.player,
             monster=self.monster,
+            last_seen_monster_position=self.last_seen_monster_position,
             visited_counts=self.visited_counts,
             seen_open_cells=self.seen_open_cells,
             seen_wall_cells=self.seen_wall_cells,

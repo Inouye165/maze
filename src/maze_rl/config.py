@@ -52,6 +52,9 @@ class MazeConfig:
 
     rows: int = 15
     cols: int = 15
+    enable_local_tactical_view: bool = False
+    local_tactical_radius: int = 2
+    local_tactical_include_monster_memory: bool = False
     vision_range: int = 4
     max_player_speed: int = 10
     monster_speed: int = 6

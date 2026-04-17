@@ -22,7 +22,12 @@ from maze_rl.render.view_state import (
     viewer_traveled_cells,
     viewer_visible_cells,
 )
-from maze_rl.training.showcase import ShowcaseResult, run_checkpoint_showcase_episode
+from maze_rl.training.showcase import (
+    PLAYBACK_MODE_RAW,
+    PLAYBACK_MODE_CHOICES,
+    ShowcaseResult,
+    run_checkpoint_showcase_episode,
+)
 
 QUIT = getattr(pygame, "QUIT", 256)
 
@@ -45,7 +50,8 @@ class ReplayViewer:
         max_no_progress_streak: int = 25,
         wall_time_timeout_s: float = 30.0,
         debug_trace: bool = False,
-        allow_policy_override: bool = False,
+        playback_mode: str = PLAYBACK_MODE_RAW,
+        allow_policy_override: bool | None = None,
     ) -> str:
         """Render a frozen run and return the final outcome."""
 
@@ -59,6 +65,7 @@ class ReplayViewer:
             wall_time_timeout_s=wall_time_timeout_s,
             on_step=lambda state: self._render_frame(state, checkpoint_path, fps),
             debug_trace=debug_trace,
+            playback_mode=playback_mode,
             allow_policy_override=allow_policy_override,
         )
         self._draw(self._screen, self._coerce_state(result, seed), self._font, checkpoint_path, outcome=result.outcome)
@@ -78,7 +85,8 @@ class ReplayViewer:
         max_no_progress_streak: int = 25,
         wall_time_timeout_s: float = 30.0,
         debug_trace: bool = False,
-        allow_policy_override: bool = False,
+        playback_mode: str = PLAYBACK_MODE_RAW,
+        allow_policy_override: bool | None = None,
     ) -> list[ShowcaseResult]:
         """Render a sequential autoplay showcase in one window."""
 
@@ -119,6 +127,7 @@ class ReplayViewer:
                 wall_time_timeout_s=wall_time_timeout_s,
                 on_step=lambda state, current_path=path: self._render_frame(state, current_path, fps),
                 debug_trace=debug_trace,
+                playback_mode=playback_mode,
                 allow_policy_override=allow_policy_override,
             )
             results.append(result)
@@ -284,6 +293,7 @@ class ReplayViewer:
                 f"capture: {state.get('capture_rule')}"
             ),
             (
+                f"mode: {state.get('playback_mode', PLAYBACK_MODE_RAW)} | "
                 f"policy: {state.get('policy_kind', 'trained')} | "
                 f"override enabled: {state.get('policy_override_enabled', False)} | "
                 f"override count: {state.get('policy_override_count', 0)} | "

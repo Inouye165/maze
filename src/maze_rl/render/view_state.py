@@ -107,10 +107,15 @@ def viewer_policy_badge(
 
     label = str(state.get("policy_decision_label", "trained policy"))
     policy_kind = str(state.get("policy_kind", "trained"))
+    playback_mode = str(state.get("playback_mode", "raw"))
     if policy_kind == "heuristic-override":
         return (label, (207, 120, 54), (255, 247, 238))
     if policy_kind == "innate":
         return (label, (79, 123, 92), (244, 250, 244))
+    if playback_mode == "assisted":
+        return (label, (64, 94, 137), (242, 246, 252))
+    if playback_mode == "raw":
+        return (label, (96, 102, 112), (243, 244, 246))
     if bool(state.get("policy_override_enabled", False)):
         return (label, (64, 94, 137), (242, 246, 252))
     return (label, (96, 102, 112), (243, 244, 246))

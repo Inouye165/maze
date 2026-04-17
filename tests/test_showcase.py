@@ -666,8 +666,8 @@ def test_heuristic_can_return_explicit_wait_action_for_env() -> None:
     assert choice.wait_action is True
 
 
-def test_playback_session_disables_override_by_default(monkeypatch) -> None:
-    """Playback should default to raw policy moves and surface override visibility."""
+def test_playback_session_raw_mode_does_not_call_override_logic(monkeypatch) -> None:
+    """Raw playback should bypass heuristic override evaluation entirely."""
 
     env = _build_loop_branch_env()
 
@@ -682,7 +682,13 @@ def test_playback_session_disables_override_by_default(monkeypatch) -> None:
         "action_probabilities",
         lambda *_args, **_kwargs: np.array([0.1, 0.1, 0.1, 0.7], dtype=np.float32),
     )
-    monkeypatch.setattr(showcase_module, "should_override_policy", lambda *_args, **_kwargs: True)
+    override_calls = {"count": 0}
+
+    def _count_override(*_args, **_kwargs):
+        override_calls["count"] += 1
+        return True
+
+    monkeypatch.setattr(showcase_module, "should_override_policy", _count_override)
 
     session = showcase_module.PlaybackSession(
         checkpoint_path="dummy",
@@ -691,19 +697,22 @@ def test_playback_session_disables_override_by_default(monkeypatch) -> None:
     )
 
     assert session.latest_state["policy_kind"] == "trained"
+    assert session.latest_state["playback_mode"] == "raw"
     assert session.latest_state["policy_override_enabled"] is False
-    assert session.latest_state["policy_decision_label"] == "trained policy"
+    assert session.latest_state["policy_decision_label"] == "raw learned policy"
 
     state, _ = session.advance()
 
+    assert override_calls["count"] == 0
     assert state["policy_kind"] == "trained"
+    assert state["playback_mode"] == "raw"
     assert state["policy_override_enabled"] is False
     assert state["policy_override_count"] == 0
     assert state["policy_override_reason"] is None
 
 
-def test_playback_session_can_enable_override(monkeypatch) -> None:
-    """Playback should expose heuristic overrides when explicitly enabled."""
+def test_playback_session_assisted_mode_calls_override_logic(monkeypatch) -> None:
+    """Assisted playback should consult and apply the override heuristic when enabled."""
 
     env = _build_loop_branch_env()
 
@@ -718,24 +727,34 @@ def test_playback_session_can_enable_override(monkeypatch) -> None:
         "action_probabilities",
         lambda *_args, **_kwargs: np.array([0.1, 0.1, 0.1, 0.7], dtype=np.float32),
     )
-    monkeypatch.setattr(showcase_module, "should_override_policy", lambda *_args, **_kwargs: True)
+    override_calls = {"count": 0}
+
+    def _count_override(*_args, **_kwargs):
+        override_calls["count"] += 1
+        return True
+
+    monkeypatch.setattr(showcase_module, "should_override_policy", _count_override)
 
     session = showcase_module.PlaybackSession(
         checkpoint_path="dummy",
         checkpoint_label="ckpt 0000",
         seed=77,
-        allow_policy_override=True,
+        playback_mode="assisted",
     )
 
     assert session.latest_state["policy_override_enabled"] is True
-    assert session.latest_state["policy_decision_label"] == "trained policy with safety net"
+    assert session.latest_state["playback_mode"] == "assisted"
+    assert session.latest_state["policy_decision_label"] == "assisted learned policy"
 
     state, _ = session.advance()
 
+    assert override_calls["count"] == 1
     assert state["policy_kind"] == "heuristic-override"
+    assert state["playback_mode"] == "assisted"
     assert state["policy_override_enabled"] is True
     assert state["policy_override_count"] == 1
     assert state["policy_override_reason"] in {"heuristic-override", "prefer-unvisited"}
+    assert state["policy_decision_label"].startswith("assisted override:")
 
 
 def test_run_checkpoint_showcase_episode_returns_incompatible_result(monkeypatch) -> None:

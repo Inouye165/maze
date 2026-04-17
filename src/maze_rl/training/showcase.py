@@ -22,7 +22,6 @@ from maze_rl.policies.model_factory import (
 )
 from maze_rl.policies.action_helpers import (
     WAIT_ACTION,
-    HeuristicMoveChoice,
     choose_heuristic_action,
     describe_move_choice,
     is_wait_action,
@@ -36,6 +35,61 @@ from maze_rl.training.checkpointing import load_checkpoint_metadata, resolve_che
 
 
 __all__ = ["WAIT_ACTION"]
+
+PLAYBACK_MODE_RAW = "raw"
+PLAYBACK_MODE_ASSISTED = "assisted"
+PLAYBACK_MODE_HEURISTIC = "heuristic"
+PLAYBACK_MODE_CHOICES = (
+    PLAYBACK_MODE_RAW,
+    PLAYBACK_MODE_ASSISTED,
+    PLAYBACK_MODE_HEURISTIC,
+)
+
+
+def normalize_playback_mode(
+    playback_mode: str | None = None,
+    allow_policy_override: bool | None = None,
+) -> str:
+    """Normalize the user-facing playback mode setting."""
+
+    if playback_mode is not None:
+        normalized = str(playback_mode).strip().lower()
+        if normalized not in PLAYBACK_MODE_CHOICES:
+            raise ValueError(f"Unsupported playback mode: {playback_mode!r}")
+        return normalized
+    return PLAYBACK_MODE_ASSISTED if allow_policy_override else PLAYBACK_MODE_RAW
+
+
+def playback_mode_label(playback_mode: str) -> str:
+    """Return a concise UI label for the active playback mode."""
+
+    labels = {
+        PLAYBACK_MODE_RAW: "Raw Policy",
+        PLAYBACK_MODE_ASSISTED: "Assisted Policy",
+        PLAYBACK_MODE_HEURISTIC: "Heuristic Baseline",
+    }
+    return labels[normalize_playback_mode(playback_mode)]
+
+
+def _playback_decision_label(
+    playback_mode: str,
+    policy_kind: str,
+    policy_override_enabled: bool,
+    policy_override_reason: str | None,
+) -> str:
+    """Return the human-facing decision label for one playback frame."""
+
+    mode = normalize_playback_mode(playback_mode)
+    if mode == PLAYBACK_MODE_HEURISTIC:
+        return "heuristic baseline"
+    if mode == PLAYBACK_MODE_RAW:
+        return "raw learned policy"
+    if policy_kind == "heuristic-override":
+        reason = policy_override_reason.replace("-", " ") if policy_override_reason else "heuristic assist"
+        return f"assisted override: {reason}"
+    if policy_override_enabled:
+        return "assisted learned policy"
+    return _policy_decision_label(policy_kind, policy_override_enabled, policy_override_reason)
 
 
 @dataclass(frozen=True)
@@ -135,6 +189,7 @@ def _decorate_committed_state(
     action_direction: int | None,
     action_speed: int | None,
     peak_no_progress_streak: int,
+    playback_mode: str = PLAYBACK_MODE_RAW,
     policy_kind: str = "trained",
     policy_override_enabled: bool = False,
     policy_override_count: int = 0,
@@ -159,11 +214,14 @@ def _decorate_committed_state(
             "capture_diagnostics": capture_diagnostics,
             "replay_turn": replay_turn,
             "turn_step": turn_step,
+            "playback_mode": normalize_playback_mode(playback_mode),
+            "playback_mode_label": playback_mode_label(playback_mode),
             "policy_kind": policy_kind,
             "policy_override_enabled": policy_override_enabled,
             "policy_override_count": policy_override_count,
             "policy_override_reason": policy_override_reason,
-            "policy_decision_label": _policy_decision_label(
+            "policy_decision_label": _playback_decision_label(
+                playback_mode,
                 policy_kind,
                 policy_override_enabled,
                 policy_override_reason,
@@ -253,9 +311,12 @@ class PlaybackSession:
     max_no_progress_streak: int = 25
     wall_time_timeout_s: float = 30.0
     debug_trace: bool = False
-    allow_policy_override: bool = False
+    playback_mode: str = PLAYBACK_MODE_RAW
+    allow_policy_override: bool | None = None
 
     def __post_init__(self) -> None:
+        self.playback_mode = normalize_playback_mode(self.playback_mode, self.allow_policy_override)
+        self.allow_policy_override = self.playback_mode == PLAYBACK_MODE_ASSISTED
         self.model, self.env, _ = load_checkpoint_for_playback(self.checkpoint_path)
         self.observation, _ = self.env.reset(seed=self.seed, options={"maze_seed": self.seed})
         self.recurrent_state = None
@@ -283,6 +344,7 @@ class PlaybackSession:
             action_direction=None,
             action_speed=None,
             peak_no_progress_streak=0,
+            playback_mode=self.playback_mode,
             policy_kind="trained",
             policy_override_enabled=self.allow_policy_override,
             policy_override_count=0,
@@ -319,9 +381,12 @@ class PlaybackSession:
         chosen_move = describe_move_choice(self.env, int(action))
         best_move = ranked_moves[0] if ranked_moves else None
         self.last_override_reason = None
-        should_override = should_override_policy(chosen_move, best_move, chosen_confidence, confidence_gap)
         override_applied = False
-        if self.allow_policy_override and should_override and best_move is not None:
+        if self.allow_policy_override and best_move is not None:
+            should_override = should_override_policy(chosen_move, best_move, chosen_confidence, confidence_gap)
+        else:
+            should_override = False
+        if should_override and best_move is not None:
             action = best_move.action
             override_applied = True
             self.policy_override_count += 1
@@ -373,6 +438,7 @@ class PlaybackSession:
             action_direction=direction,
             action_speed=speed,
             peak_no_progress_streak=max(self.env.peak_no_progress_steps, self.no_progress_streak),
+            playback_mode=self.playback_mode,
             policy_kind="heuristic-override" if override_applied else "trained",
             policy_override_enabled=self.allow_policy_override,
             policy_override_count=self.policy_override_count,
@@ -459,6 +525,7 @@ class BaselinePlaybackSession:
             action_direction=None,
             action_speed=None,
             peak_no_progress_streak=0,
+            playback_mode=PLAYBACK_MODE_HEURISTIC,
             policy_kind="innate",
             policy_override_enabled=False,
             policy_override_count=0,
@@ -512,6 +579,7 @@ class BaselinePlaybackSession:
             action_direction=direction,
             action_speed=speed,
             peak_no_progress_streak=max(self.env.peak_no_progress_steps, self.no_progress_streak),
+            playback_mode=PLAYBACK_MODE_HEURISTIC,
             policy_kind="innate",
             policy_override_enabled=False,
             policy_override_count=0,
@@ -593,20 +661,34 @@ def run_checkpoint_showcase_episode(
     wall_time_timeout_s: float = 30.0,
     on_step: Callable[[dict[str, Any]], bool] | None = None,
     debug_trace: bool = False,
-    allow_policy_override: bool = False,
+    playback_mode: str = PLAYBACK_MODE_RAW,
+    allow_policy_override: bool | None = None,
 ) -> ShowcaseResult:
     """Run one deterministic checkpoint episode with guardrails."""
 
     try:
-        session = PlaybackSession(
-            checkpoint_path=checkpoint_path,
-            checkpoint_label=checkpoint_label,
-            seed=seed,
-            max_no_progress_streak=max_no_progress_streak,
-            wall_time_timeout_s=wall_time_timeout_s,
-            debug_trace=debug_trace,
-            allow_policy_override=allow_policy_override,
-        )
+        normalized_mode = normalize_playback_mode(playback_mode, allow_policy_override)
+        if normalized_mode == PLAYBACK_MODE_HEURISTIC:
+            metadata = load_checkpoint_metadata(checkpoint_path)
+            maze_config = maze_config_from_dict(metadata["maze_config"])
+            session = BaselinePlaybackSession(
+                maze_config=maze_config,
+                checkpoint_label=checkpoint_label,
+                seed=seed,
+                max_no_progress_streak=max_no_progress_streak,
+                wall_time_timeout_s=wall_time_timeout_s,
+                debug_trace=debug_trace,
+            )
+        else:
+            session = PlaybackSession(
+                checkpoint_path=checkpoint_path,
+                checkpoint_label=checkpoint_label,
+                seed=seed,
+                max_no_progress_streak=max_no_progress_streak,
+                wall_time_timeout_s=wall_time_timeout_s,
+                debug_trace=debug_trace,
+                playback_mode=normalized_mode,
+            )
     except CheckpointCompatibilityError as error:
         return build_incompatible_result(
             checkpoint_label=checkpoint_label,
@@ -714,7 +796,8 @@ def run_showcase_headless(
     max_no_progress_streak: int = 25,
     wall_time_timeout_s: float = 30.0,
     debug_trace: bool = False,
-    allow_policy_override: bool = False,
+    playback_mode: str = PLAYBACK_MODE_RAW,
+    allow_policy_override: bool | None = None,
 ) -> list[ShowcaseResult]:
     """Run a sequential headless showcase over checkpoint episodes."""
 
@@ -732,6 +815,7 @@ def run_showcase_headless(
                 max_no_progress_streak=max_no_progress_streak,
                 wall_time_timeout_s=wall_time_timeout_s,
                 debug_trace=debug_trace,
+                playback_mode=playback_mode,
                 allow_policy_override=allow_policy_override,
             )
         )
