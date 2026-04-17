@@ -37,3 +37,36 @@ def test_training_config_from_dict_ignores_unknown_fields() -> None:
 
     assert config.episodes == 123
     assert config.checkpoint_episodes == (0, 50)
+
+
+def test_maze_config_from_dict_restores_local_tactical_and_curriculum_fields() -> None:
+    """Serialized maze config should rebuild additive observation and curriculum settings."""
+
+    config = maze_config_from_dict(
+        {
+            "rows": 15,
+            "cols": 15,
+            "enable_local_tactical_view": True,
+            "local_tactical_radius": 3,
+            "local_tactical_include_monster_memory": True,
+            "curriculum": [
+                {
+                    "start_episode": 0,
+                    "rows": 9,
+                    "cols": 9,
+                    "monster_speed": 1,
+                    "monster_activation_delay": 10,
+                    "max_episode_steps": 60,
+                    "stall_threshold": 20,
+                    "monster_move_interval": 1,
+                    "label": "bootstrap",
+                }
+            ],
+        }
+    )
+
+    assert config.enable_local_tactical_view is True
+    assert config.local_tactical_radius == 3
+    assert config.local_tactical_include_monster_memory is True
+    assert config.curriculum[0].rows == 9
+    assert config.curriculum[0].label == "bootstrap"

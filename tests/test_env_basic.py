@@ -67,8 +67,8 @@ def test_env_focused_seed_runs_requested_seed_once_then_jumps_forward() -> None:
     assert 1 <= third_info["maze_seed"] - second_info["maze_seed"] <= 1000
 
 
-def test_action_masks_block_corner_oscillation_when_better_move_exists() -> None:
-    """Masking should drop short-loop backtracking when fresh space is available."""
+def test_action_masks_keep_legal_backtrack_when_better_move_exists() -> None:
+    """Illegal-only masking must not remove legal backtracking just because a fresh branch exists."""
 
     env = MazeEnv(
         MazeConfig(
@@ -103,12 +103,13 @@ def test_action_masks_block_corner_oscillation_when_better_move_exists() -> None
 
     masks = env.action_masks()
 
-    assert masks[3] is False
+    assert masks[3] is True
     assert masks[2] is True
+    assert masks[env.wait_action_index] is True
 
 
 def test_action_masks_allow_backtrack_when_it_is_only_exit_from_dead_end() -> None:
-    """Masking should not trap the agent by removing the only legal escape move."""
+    """Illegal-only masking should keep the only legal escape move and the wait action available."""
 
     env = MazeEnv(
         MazeConfig(
@@ -140,11 +141,12 @@ def test_action_masks_allow_backtrack_when_it_is_only_exit_from_dead_end() -> No
     masks = env.action_masks()
 
     assert masks[3] is True
-    assert sum(bool(item) for item in masks) == 1
+    assert masks[env.wait_action_index] is True
+    assert sum(bool(item) for item in masks) == 2
 
 
-def test_action_masks_force_flee_move_when_monster_is_visible_in_open_space() -> None:
-    """When the monster is visible and escape exists, masking should force the innate flee move."""
+def test_action_masks_keep_legal_moves_when_monster_is_visible_in_open_space() -> None:
+    """Legal actions must stay available even when the monster is visible."""
 
     env = MazeEnv(
         MazeConfig(
@@ -186,11 +188,11 @@ def test_action_masks_force_flee_move_when_monster_is_visible_in_open_space() ->
     masks = env.action_masks()
 
     assert env.get_state_snapshot()["monster_visible"] is True
-    assert masks == [False, False, False, True, False]
+    assert masks == [True, False, True, True, True]
 
 
-def test_action_masks_force_fastest_escape_speed_when_visible_monster_has_clear_corridor() -> None:
-    """Visible-monster flee masking should preserve the human speed advantage in long corridors."""
+def test_action_masks_keep_multiple_legal_speeds_when_visible_monster_has_clear_corridor() -> None:
+    """Legal speed choices must remain available even in visible-monster corridors."""
 
     env = MazeEnv(
         MazeConfig(
@@ -221,8 +223,146 @@ def test_action_masks_force_fastest_escape_speed_when_visible_monster_has_clear_
 
     expected_action = 3 * env.config.max_player_speed + (4 - 1)
     assert env.get_state_snapshot()["monster_visible"] is True
-    assert sum(bool(item) for item in masks) == 1
     assert masks[expected_action] is True
+    assert masks[3 * env.config.max_player_speed] is True
+    assert masks[env.wait_action_index] is True
+    assert sum(bool(item) for item in masks) > 2
+
+
+def test_observation_keeps_full_human_known_map_as_primary_features() -> None:
+    """The observation prefix should remain the full configured remembered map."""
+
+    env = MazeEnv(
+        MazeConfig(
+            rows=7,
+            cols=7,
+            monster_speed=0,
+            monster_activation_delay=999,
+            curriculum_enabled=False,
+        ),
+        training_mode=False,
+    )
+    layout = MazeLayout(
+        grid=(
+            "#####",
+            "#...#",
+            "#...#",
+            "#...#",
+            "#####",
+        ),
+        player_start=Position(1, 1),
+        monster_start=Position(3, 3),
+        exit_position=Position(3, 1),
+        seed=801,
+    )
+
+    observation, _ = env.reset(options={"layout": layout, "maze_seed": 801})
+
+    player_index = (1 * env.observation_spec.cols + 1) * env.observation_spec.cell_channels
+    unseen_outside_layout_index = (6 * env.observation_spec.cols + 6) * env.observation_spec.cell_channels
+
+    assert env.observation_spec.global_map_length == 7 * 7 * env.observation_spec.cell_channels
+    assert observation[player_index + 1] == 1.0
+    assert observation[player_index + 3] == 1.0
+    assert np.allclose(
+        observation[unseen_outside_layout_index : unseen_outside_layout_index + env.observation_spec.cell_channels],
+        np.zeros(env.observation_spec.cell_channels, dtype=np.float32),
+    )
+
+
+def test_local_tactical_view_appends_without_removing_global_or_scalar_features() -> None:
+    """Optional local tactical features should be inserted between the global map and scalar tail."""
+
+    layout = MazeLayout(
+        grid=(
+            "#######",
+            "#.....#",
+            "#.....#",
+            "#.....#",
+            "#######",
+        ),
+        player_start=Position(2, 2),
+        monster_start=Position(2, 4),
+        exit_position=Position(1, 5),
+        seed=802,
+    )
+    base_env = MazeEnv(
+        MazeConfig(
+            rows=7,
+            cols=7,
+            monster_speed=0,
+            monster_activation_delay=999,
+            curriculum_enabled=False,
+        ),
+        training_mode=False,
+    )
+    tactical_env = MazeEnv(
+        MazeConfig(
+            rows=7,
+            cols=7,
+            enable_local_tactical_view=True,
+            local_tactical_radius=1,
+            monster_speed=0,
+            monster_activation_delay=999,
+            curriculum_enabled=False,
+        ),
+        training_mode=False,
+    )
+
+    base_observation, _ = base_env.reset(options={"layout": layout, "maze_seed": 802})
+    tactical_observation, _ = tactical_env.reset(options={"layout": layout, "maze_seed": 802})
+
+    assert tactical_env.observation_spec.local_tactical_vector_length == 3 * 3 * tactical_env.observation_spec.cell_channels
+    assert np.allclose(
+        tactical_observation[: base_env.observation_spec.global_map_length],
+        base_observation[: base_env.observation_spec.global_map_length],
+    )
+    assert np.allclose(
+        tactical_observation[-base_env.observation_spec.scalar_features :],
+        base_observation[-base_env.observation_spec.scalar_features :],
+    )
+
+
+def test_local_tactical_view_can_encode_last_seen_monster_memory() -> None:
+    """The optional local tactical patch should be able to append last-seen monster memory."""
+
+    env = MazeEnv(
+        MazeConfig(
+            rows=5,
+            cols=5,
+            enable_local_tactical_view=True,
+            local_tactical_radius=1,
+            local_tactical_include_monster_memory=True,
+            monster_speed=0,
+            monster_activation_delay=999,
+            curriculum_enabled=False,
+        ),
+        training_mode=False,
+    )
+    layout = MazeLayout(
+        grid=(
+            "#####",
+            "#...#",
+            "#...#",
+            "#...#",
+            "#####",
+        ),
+        player_start=Position(2, 2),
+        monster_start=Position(2, 3),
+        exit_position=Position(1, 1),
+        seed=803,
+    )
+
+    env.reset(options={"layout": layout, "maze_seed": 803})
+    env.last_seen_monster_position = Position(2, 3)
+    observation = env._get_observation()
+
+    patch_start = env.observation_spec.global_map_length
+    patch_channels = env.observation_spec.local_tactical_cell_channels
+    remembered_monster_cell = patch_start + (1 * 3 + 2) * patch_channels + (patch_channels - 1)
+
+    assert observation.shape[0] == env.observation_spec.vector_length
+    assert observation[remembered_monster_cell] == 1.0
 
 
 def test_episode_reports_avoidable_capture_when_clear_escape_was_ignored() -> None:
@@ -572,7 +712,7 @@ def test_player_is_caught_when_monster_reaches_same_junction_cell() -> None:
     assert info["state_snapshot"]["player_position"] == (3, 3)
     assert info["state_snapshot"]["monster_position"] == (3, 3)
     assert info["state_snapshot"]["monster_visible"] is True
-    assert masks[3] is False
+    assert masks[3] is True
     assert any(masks[index] for index in (1, 2))
 
 

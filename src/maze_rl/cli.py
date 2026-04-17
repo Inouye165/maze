@@ -5,14 +5,55 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from maze_rl.config import MazeConfig, TrainingConfig
+from maze_rl.config import CurriculumStage, MazeConfig, TrainingConfig
 from maze_rl.policies.model_factory import CheckpointCompatibilityError
 from maze_rl.render.control_app import run_app
 from maze_rl.render.replay_viewer import ReplayViewer
 from maze_rl.training.checkpointing import resolve_checkpoint_path
 from maze_rl.training.evaluate import evaluate_checkpoint
-from maze_rl.training.showcase import format_showcase_table, run_showcase_headless, save_showcase_summary
+from maze_rl.training.showcase import (
+    PLAYBACK_MODE_CHOICES,
+    PLAYBACK_MODE_RAW,
+    format_showcase_table,
+    run_showcase_headless,
+    save_showcase_summary,
+)
 from maze_rl.training.train import format_training_progress, train_from_scratch
+
+
+def _parse_curriculum_stage(value: str) -> CurriculumStage:
+    """Parse one explicit curriculum stage from the CLI."""
+
+    parts = [item.strip() for item in value.split(":")]
+    if len(parts) not in {7, 8, 9}:
+        raise argparse.ArgumentTypeError(
+            "curriculum stages must use start:rows:cols:monster_speed:monster_activation_delay:max_episode_steps:stall_threshold[:monster_move_interval[:label]]"
+        )
+
+    try:
+        start_episode = int(parts[0])
+        rows = int(parts[1])
+        cols = int(parts[2])
+        monster_speed = int(parts[3])
+        monster_activation_delay = int(parts[4])
+        max_episode_steps = int(parts[5])
+        stall_threshold = int(parts[6])
+        monster_move_interval = int(parts[7]) if len(parts) >= 8 else 1
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"invalid curriculum stage: {value}") from error
+
+    label = parts[8] if len(parts) == 9 else f"stage-{start_episode}"
+    return CurriculumStage(
+        start_episode=start_episode,
+        rows=rows,
+        cols=cols,
+        monster_speed=monster_speed,
+        monster_activation_delay=monster_activation_delay,
+        max_episode_steps=max_episode_steps,
+        stall_threshold=stall_threshold,
+        monster_move_interval=monster_move_interval,
+        label=label,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -28,8 +69,12 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--held-out-seed", type=int, default=12_345)
     train_parser.add_argument("--rows", type=int, default=15)
     train_parser.add_argument("--cols", type=int, default=15)
+    train_parser.add_argument("--enable-local-tactical-view", action="store_true")
+    train_parser.add_argument("--local-tactical-radius", type=int, default=2)
+    train_parser.add_argument("--local-tactical-include-monster-memory", action="store_true")
     train_parser.add_argument("--checkpoint-interval", type=int, default=250)
     train_parser.add_argument("--disable-curriculum", action="store_true")
+    train_parser.add_argument("--curriculum-stage", action="append", type=_parse_curriculum_stage, default=None)
 
     eval_parser = subparsers.add_parser("eval", help="Evaluate one checkpoint")
     eval_parser.add_argument("--checkpoint", required=True)
@@ -44,6 +89,7 @@ def build_parser() -> argparse.ArgumentParser:
     watch_parser.add_argument("--seed", type=int, required=True)
     watch_parser.add_argument("--fps", type=int, default=10)
     watch_parser.add_argument("--debug-trace", action="store_true")
+    watch_parser.add_argument("--playback-mode", choices=PLAYBACK_MODE_CHOICES, default=PLAYBACK_MODE_RAW)
     watch_parser.add_argument("--allow-policy-override", action="store_true")
 
     compare_parser = subparsers.add_parser("compare", help="Compare multiple checkpoints on one seed")
@@ -62,6 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
     showcase_parser.add_argument("--wall-timeout-s", type=float, default=30.0)
     showcase_parser.add_argument("--save-summary-json", default=None)
     showcase_parser.add_argument("--debug-trace", action="store_true")
+    showcase_parser.add_argument("--playback-mode", choices=PLAYBACK_MODE_CHOICES, default=PLAYBACK_MODE_RAW)
     showcase_parser.add_argument("--allow-policy-override", action="store_true")
 
     app_parser = subparsers.add_parser("app", help="Open the local control panel app")
@@ -78,15 +125,21 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.command == "train":
-        maze_config = MazeConfig(rows=args.rows, cols=args.cols, held_out_seed=args.held_out_seed)
+        maze_kwargs = {
+            "rows": args.rows,
+            "cols": args.cols,
+            "held_out_seed": args.held_out_seed,
+            "enable_local_tactical_view": args.enable_local_tactical_view,
+            "local_tactical_radius": args.local_tactical_radius,
+            "local_tactical_include_monster_memory": args.local_tactical_include_monster_memory,
+        }
         if args.disable_curriculum:
-            maze_config = MazeConfig(
-                rows=args.rows,
-                cols=args.cols,
-                held_out_seed=args.held_out_seed,
-                curriculum_enabled=False,
-                reward=maze_config.reward,
+            maze_kwargs["curriculum_enabled"] = False
+        elif args.curriculum_stage:
+            maze_kwargs["curriculum"] = tuple(
+                sorted(args.curriculum_stage, key=lambda stage: stage.start_episode)
             )
+        maze_config = MazeConfig(**maze_kwargs)
         training_config = TrainingConfig(
             episodes=args.episodes,
             algorithm=args.algorithm,
@@ -146,12 +199,15 @@ def main() -> None:
 
     if args.command == "watch":
         try:
+            playback_mode = args.playback_mode
+            if args.allow_policy_override and playback_mode == PLAYBACK_MODE_RAW:
+                playback_mode = "assisted"
             outcome = ReplayViewer().watch(
                 args.checkpoint,
                 seed=args.seed,
                 fps=args.fps,
                 debug_trace=args.debug_trace,
-                allow_policy_override=args.allow_policy_override,
+                playback_mode=playback_mode,
             )
         except CheckpointCompatibilityError as error:
             parser.exit(2, f"checkpoint compatibility error: {error}\n")
@@ -183,6 +239,9 @@ def main() -> None:
             (checkpoint_episode, resolve_checkpoint_path(args.checkpoint_dir, checkpoint_episode))
             for checkpoint_episode in args.checkpoints
         ]
+        playback_mode = args.playback_mode
+        if args.allow_policy_override and playback_mode == PLAYBACK_MODE_RAW:
+            playback_mode = "assisted"
         if args.headless:
             try:
                 results = run_showcase_headless(
@@ -192,7 +251,7 @@ def main() -> None:
                     max_no_progress_streak=args.max_no_progress_streak,
                     wall_time_timeout_s=args.wall_timeout_s,
                     debug_trace=args.debug_trace,
-                    allow_policy_override=args.allow_policy_override,
+                    playback_mode=playback_mode,
                 )
             except CheckpointCompatibilityError as error:
                 parser.exit(2, f"checkpoint compatibility error: {error}\n")
@@ -206,7 +265,7 @@ def main() -> None:
                     max_no_progress_streak=args.max_no_progress_streak,
                     wall_time_timeout_s=args.wall_timeout_s,
                     debug_trace=args.debug_trace,
-                    allow_policy_override=args.allow_policy_override,
+                    playback_mode=playback_mode,
                 )
             except CheckpointCompatibilityError as error:
                 parser.exit(2, f"checkpoint compatibility error: {error}\n")

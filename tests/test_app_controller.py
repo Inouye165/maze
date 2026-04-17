@@ -94,7 +94,7 @@ def test_app_controller_supports_baseline_current_ai_and_replay(tmp_path: Path) 
     controller.start_current_ai_run()
     assert controller.session is not None
     assert controller.current_mode == "current-learned-ai"
-    assert getattr(controller.session, "allow_policy_override", False) is True
+    assert getattr(controller.session, "allow_policy_override", False) is False
 
 
 def test_basic_tab_uses_play_label_instead_of_marks_play(tmp_path: Path) -> None:
@@ -105,7 +105,7 @@ def test_basic_tab_uses_play_label_instead_of_marks_play(tmp_path: Path) -> None
     app = LabControlApp(checkpoint_dir=tmp_path)
     labels = app.visible_button_labels()
 
-    assert "Play" in labels
+    assert "Play Raw" in labels
     assert "Marks Play" not in labels
 
 
@@ -146,6 +146,7 @@ def test_review_tab_exposes_seed_filter_toggle(tmp_path: Path) -> None:
     labels = app.visible_button_labels()
 
     assert "Filter Seed" in labels
+    assert "Mode: Raw Policy" in labels
 
 
 def test_play_runs_innate_mode_without_checkpoint(tmp_path: Path) -> None:
@@ -159,7 +160,7 @@ def test_play_runs_innate_mode_without_checkpoint(tmp_path: Path) -> None:
     assert controller.current_mode == "baseline-legal-mover"
     assert controller.seed_text == "00001"
     assert controller.seed_ladder_active is True
-    assert controller.play_mode_status() == "Policy: Innate"
+    assert controller.play_mode_status() == "Policy: Heuristic Baseline"
 
 
 def test_play_runs_trained_mode_when_checkpoint_exists(tmp_path: Path) -> None:
@@ -173,7 +174,21 @@ def test_play_runs_trained_mode_when_checkpoint_exists(tmp_path: Path) -> None:
     assert controller.session is not None
     assert controller.current_mode == "current-learned-ai"
     assert controller.seed_ladder_active is True
-    assert controller.play_mode_status() == "Policy: Trained (ckpt 0000)"
+    assert controller.play_mode_status() == "Policy: Raw Policy (ckpt 0000)"
+    assert getattr(controller.session, "allow_policy_override", False) is False
+
+
+def test_controller_can_switch_to_assisted_playback_mode(tmp_path: Path) -> None:
+    """The control app should keep assisted playback explicit and separately labeled."""
+
+    _create_checkpoints(tmp_path, episodes=(0,))
+
+    controller = LabAppController(checkpoint_dir=tmp_path)
+    controller.set_playback_mode("assisted")
+    controller.start_current_ai_run()
+
+    assert controller.session is not None
+    assert controller.play_mode_status() == "Policy: Assisted Policy (ckpt 0000)"
     assert getattr(controller.session, "allow_policy_override", False) is True
 
 
@@ -218,7 +233,7 @@ def test_play_falls_back_to_innate_when_selected_checkpoint_is_incompatible(
     assert controller.session is not None
     assert controller.current_mode == "baseline-legal-mover"
     assert controller.seed_ladder_active is True
-    assert controller.play_mode_status() == "Policy: Innate"
+    assert controller.play_mode_status() == "Policy: Heuristic Baseline"
     assert "incompatible" in controller.training_message
     assert "innate policy" in controller.training_message
 
@@ -253,11 +268,11 @@ def test_play_increments_seed_until_loss_then_trains_failed_seed(
             checkpoint_label: str,
             seed: int,
             debug_trace: bool,
-            allow_policy_override: bool,
+            playback_mode: str,
         ) -> None:
             _ = checkpoint_path
             _ = debug_trace
-            self.allow_policy_override = allow_policy_override
+            self.allow_policy_override = playback_mode == "assisted"
             self.seed = seed
             self.checkpoint_label = checkpoint_label
             self.latest_state = {
@@ -433,11 +448,11 @@ def test_seed_ladder_auto_increment_skips_masked_seed(tmp_path: Path, monkeypatc
             checkpoint_label: str,
             seed: int,
             debug_trace: bool,
-            allow_policy_override: bool,
+            playback_mode: str,
         ) -> None:
             _ = checkpoint_path
             _ = debug_trace
-            self.allow_policy_override = allow_policy_override
+            self.allow_policy_override = playback_mode == "assisted"
             self.seed = seed
             self.checkpoint_label = checkpoint_label
             self.latest_state = {
@@ -836,10 +851,10 @@ def test_reset_training_returns_play_to_innate_mode(tmp_path: Path) -> None:
     _create_checkpoints(tmp_path, episodes=(0, 50))
     controller = LabAppController(checkpoint_dir=tmp_path)
 
-    assert controller.play_mode_status() == "Policy: Trained (ckpt 0050)"
+    assert controller.play_mode_status() == "Policy: Raw Policy (ckpt 0050)"
     controller.reset_training()
     controller.start_play()
 
-    assert controller.play_mode_status() == "Policy: Innate"
+    assert controller.play_mode_status() == "Policy: Heuristic Baseline"
     assert controller.session is not None
     assert controller.current_mode == "baseline-legal-mover"
